@@ -47,7 +47,7 @@ function StatusPage() {
   const t = useStatusTranslation(locale);
 
   const { theme, setTheme } = useTheme("status-theme");
-  const { disconnectClient, setLogLevel, clearLogs, reloadConfig, restartWorkers } = useStatusApi();
+  const { disconnectClient, setLogLevel, clearLogs, reloadConfig, restartWorkers, openPlaylist, copyPlaylistUrl } = useStatusApi();
 
   const [connectionState, setConnectionState] = useState<ConnectionState>("reconnecting");
   const [payload, setPayload] = useState<StatusPayload | null>(null);
@@ -140,6 +140,23 @@ function StatusPage() {
       window.alert(`Failed to restart workers: ${error}`);
     }
   }, [restartWorkers]);
+
+  const handleOpenPlaylist = useCallback(() => {
+    openPlaylist();
+  }, [openPlaylist]);
+
+  const handleCopyPlaylistUrl = useCallback(async () => {
+    try {
+      const success = await copyPlaylistUrl();
+      if (success) {
+        window.alert(t('playlistUrlCopied'));
+      } else {
+        window.alert(t('failedToCopyPlaylistUrl'));
+      }
+    } catch (error) {
+      window.alert(`${t('failedToCopyPlaylistUrl')}: ${error}`);
+    }
+  }, [copyPlaylistUrl, t]);
 
   const uptime = payload ? formatDuration(payload.uptimeMs) : "--";
 
@@ -246,6 +263,8 @@ function StatusPage() {
             onReloadConfig={handleReloadConfig}
             onRestartWorkers={handleRestartWorkers}
             onClearLogs={handleClearLogs}
+            onOpenPlaylist={handleOpenPlaylist}
+            onCopyPlaylistUrl={handleCopyPlaylistUrl}
             disabled={connectionState !== "connected"}
             locale={locale}
           />
