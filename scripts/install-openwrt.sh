@@ -12,7 +12,7 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 # GitHub 仓库信息
-REPO_OWNER="stackia"
+REPO_OWNER="mjl371"
 REPO_NAME="rtp2httpd"
 
 # GitHub 访问方式配置(将在用户选择后设置)
