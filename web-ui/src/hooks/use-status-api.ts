@@ -55,11 +55,43 @@ export function useStatusApi() {
     }
   }, []);
 
+  const openPlaylist = useCallback(() => {
+    const playlistUrl = buildUrl("/playlist.m3u");
+    window.open(playlistUrl, "_blank");
+  }, []);
+
+  const copyPlaylistUrl = useCallback(async () => {
+    const playlistUrl = buildUrl("/playlist.m3u");
+    try {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(playlistUrl);
+        return true;
+      } else {
+        const textArea = document.createElement("textarea");
+        textArea.value = playlistUrl;
+        textArea.style.position = "fixed";
+        textArea.style.left = "-999999px";
+        textArea.style.top = "-999999px";
+        document.body.appendChild(textArea);
+        textArea.focus();
+        textArea.select();
+        const success = document.execCommand('copy');
+        document.body.removeChild(textArea);
+        return success;
+      }
+    } catch (error) {
+      console.error("Failed to copy playlist URL:", error);
+      return false;
+    }
+  }, []);
+
   return {
     disconnectClient,
     setLogLevel,
     clearLogs,
     reloadConfig,
     restartWorkers,
+    openPlaylist,
+    copyPlaylistUrl,
   };
 }

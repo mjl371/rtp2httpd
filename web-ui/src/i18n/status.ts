@@ -96,6 +96,11 @@ const base: TranslationDict = {
   reloading: "Reloading…",
   restarting: "Restarting…",
   clearing: "Clearing…",
+  openPlaylist: "Open Playlist",
+  copyPlaylistUrl: "Copy Playlist URL",
+  copying: "Copying…",
+  playlistUrlCopied: "Playlist URL copied to clipboard!",
+  failedToCopyPlaylistUrl: "Failed to copy playlist URL",
 };
 
 const zhHans: TranslationDict = {
@@ -192,6 +197,11 @@ const zhHans: TranslationDict = {
   reloading: "重载中…",
   restarting: "重启中…",
   clearing: "清空中…",
+  openPlaylist: "打开播放列表",
+  copyPlaylistUrl: "复制播放列表链接",
+  copying: "复制中…",
+  playlistUrlCopied: "播放列表链接已复制到剪贴板！",
+  failedToCopyPlaylistUrl: "复制播放列表链接失败",
 };
 
 const zhHant: TranslationDict = {
@@ -288,6 +298,11 @@ const zhHant: TranslationDict = {
   reloading: "重載中…",
   restarting: "重啟中…",
   clearing: "清空中…",
+  openPlaylist: "開啟播放清單",
+  copyPlaylistUrl: "複製播放清單連結",
+  copying: "複製中…",
+  playlistUrlCopied: "播放清單連結已複製到剪貼簿！",
+  failedToCopyPlaylistUrl: "複製播放清單連結失敗",
 };
 
 export const translations: Record<Locale, TranslationDict> = {
