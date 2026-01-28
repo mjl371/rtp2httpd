@@ -12,7 +12,7 @@ CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 # GitHub 仓库信息
-REPO_OWNER="mjl371"
+REPO_OWNER="stackia"
 REPO_NAME="rtp2httpd"
 
 # GitHub 访问方式配置(将在用户选择后设置)
@@ -24,7 +24,7 @@ GITHUB_RAW=""
 TMP_DIR="/tmp/rtp2httpd_install"
 
 # 是否使用 prerelease 版本
-USE_PRERELEASE=ture
+USE_PRERELEASE=false
 
 # 打印信息函数
 print_info() {
@@ -529,25 +529,11 @@ main() {
     print_info ""
     print_info "已安装版本: $VERSION"
     print_info ""
-    
-    # 重启 rtp2httpd 进程
-    print_info "重启 rtp2httpd 服务..."
-    if command -v /etc/init.d/rtp2httpd >/dev/null 2>&1; then
-        if /etc/init.d/rtp2httpd restart >/dev/null 2>&1; then
-            print_info "rtp2httpd 服务重启成功！"
-        else
-            print_warn "rtp2httpd 服务重启失败，可能需要手动重启"
-        fi
-    else
-        print_warn "未找到 rtp2httpd 服务脚本，可能需要手动启动服务"
-    fi
-    
-    print_info ""
     print_info "后续步骤："
     print_info "1. 访问 LuCI 管理界面"
     print_info "2. 在 '服务' 菜单中找到 'rtp2httpd'"
     print_info "3. 根据需要配置服务参数"
-    print_info "4. 确认服务状态"
+    print_info "4. 启动服务"
     print_info ""
     print_info "更多信息请访问: https://github.com/${REPO_OWNER}/${REPO_NAME}"
     print_info ""
