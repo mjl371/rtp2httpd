@@ -66,7 +66,7 @@ function hasHashInFilename(filename) {
 
 function scanDirectory(dir, baseDir = dir) {
   const files = [];
-  const entries = readdirSync(dir);
+  const entries = readdirSync(dir).sort(); // 对条目排序，确保顺序一致
 
   for (const entry of entries) {
     const fullPath = join(dir, entry);
@@ -134,6 +134,9 @@ function main() {
       `  ${file.path} (${(content.length / 1000).toFixed(1)}KB → ${(compressed.length / 1000).toFixed(1)}KB, ${cacheType})`
     );
   }
+
+  // Sort embedded files by path to ensure consistent order
+  embeddedFiles.sort((a, b) => a.path.localeCompare(b.path));
 
   console.log(
     `\nTotal size: ${(totalOriginalSize / 1000).toFixed(1)}KB → ${(totalCompressedSize / 1000).toFixed(1)}KB ` +
