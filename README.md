@@ -12,6 +12,7 @@ rtp2httpd 支持将组播 RTP/UDP 流、RTSP 流转换为 HTTP 单播流，并�
 - **UDPxy 兼容性**：完全兼容 UDPxy URL 格式
 - **RTSP 转 HTTP 视频流**：完整支持 RTSP/RTP 协议栈，包括 TCP 和 UDP 传输模式
   - 可以实现 IPTV RTSP 时移源的回看
+- **HTTP 反向代理**：可以反向代理 IPTV 内网 HLS 源，方便在局域网、公网观看
 - **M3U 播放列表集成**：支持 M3U/M3U8 格式，自动识别并转换节目地址，提供标准化的播放列表
   - 支持外部 M3U URL
   - 智能识别 RTP/RTSP URL 并转换为 HTTP 代理格式
@@ -113,6 +114,7 @@ rtp2httpd 支持多种部署方式：
 - **[配置参数详解](docs/configuration.md)**：完整配置选项说明
 - **[FCC 快速换台配置](docs/fcc-setup.md)**：启用毫秒级换台功能
 - **[视频快照配置](docs/video-snapshot.md)**：频道预览图功能配置
+- **[性能测试报告](docs/benchmark.md)**：与 msd_lite、udpxy、tvgate 的性能对比
 
 如果是首次搭建 IPTV 组播转发服务，对相关网络知识比较陌生（DHCP 鉴权、路由、组播、防火墙），这里也推荐以下教程：
 
