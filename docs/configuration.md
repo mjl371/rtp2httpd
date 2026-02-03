@@ -20,8 +20,9 @@ rtp2httpd [选项]
 - `-f, --upstream-interface-fcc <接口>` - FCC 上游接口（覆盖 `-i` 设置）
 - `-t, --upstream-interface-rtsp <接口>` - RTSP 上游接口（覆盖 `-i` 设置）
 - `-r, --upstream-interface-multicast <接口>` - 组播上游接口（覆盖 `-i` 设置）
+- `-y, --upstream-interface-http <接口>` - HTTP 代理上游接口（覆盖 `-i` 设置）
 
-**优先级规则**：`upstream-interface-{fcc,rtsp,multicast}` > `upstream-interface` > 系统路由表
+**优先级规则**：`upstream-interface-{fcc,rtsp,multicast,http}` > `upstream-interface` > 系统路由表
 
 ### 性能优化
 
@@ -63,6 +64,13 @@ rtp2httpd [选项]
 ### 兼容性
 
 - `-U, --noudpxy` - 禁用 UDPxy 兼容模式 (禁用后只能使用 `[services]` 或 `external-m3u` 中定义的服务)
+
+### RTSP NAT 穿透
+
+- `-N, --rtsp-stun-server <host:port>` - STUN 服务器地址 (默认: 禁用)
+  - 当 RTSP 服务器仅支持 UDP 传输且客户端位于 NAT 后时，可尝试使用 STUN 进行 NAT 穿透（不保证成功）
+  - 格式：`host:port` 或 `host`（默认端口 3478）
+  - 示例：`stun.miwifi.com` 或 `stun.miwifi.com:3478`
 
 ### 其他
 
@@ -120,12 +128,13 @@ upstream-interface = eth0
 # upstream-interface-multicast = eth0  # 组播流量 (RTP/UDP)
 # upstream-interface-fcc = eth1        # FCC
 # upstream-interface-rtsp = eth2       # RTSP
+# upstream-interface-http = eth3       # HTTP 代理
 #
 # 混合配置示例：默认使用 eth0，但 FCC 使用更快的 eth1
 # upstream-interface = eth0
 # upstream-interface-fcc = eth1
 #
-# 优先级：upstream-interface-{multicast,fcc,rtsp} > upstream-interface > 系统路由表
+# 优先级：upstream-interface-{multicast,fcc,rtsp,http} > upstream-interface > 系统路由表
 
 # 外部 M3U 配置（支持 file://, http://, https://）
 # 注意：HTTP/HTTPS 需要安装 curl 命令
@@ -167,6 +176,11 @@ udp-rcvbuf-size = 524288
 # 在支持的设备上可提升吞吐量并降低 CPU 占用，特别是在高并发负载下
 # 如果你的 rtp2httpd 位于反向代理之后 (nginx/caddy/lucky 等)，不建议开启这个选项
 zerocopy-on-send = no
+
+# STUN 服务器用于 RTSP NAT 穿透（默认: 禁用）
+# 当 RTSP 服务器仅支持 UDP 传输且客户端位于 NAT 后时，可尝试使用 STUN 进行 NAT 穿透（不保证成功）
+# 格式: host:port 或 host（默认端口 3478）
+rtsp-stun-server = stun.miwifi.com
 
 # 启用视频快照功能（默认: no）
 # 启用后可通过 `snapshot=1` 查询参数获取视频流的实时快照

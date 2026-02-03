@@ -67,6 +67,9 @@ typedef struct {
   char upstream_interface_multicast
       [IFNAMSIZ]; /* Interface for upstream multicast media requests (overrides
                      upstream_interface) */
+  char upstream_interface_http[IFNAMSIZ]; /* Interface for HTTP proxy upstream
+                                             requests (overrides
+                                             upstream_interface) */
 
   /* Multicast settings */
   int mcast_rejoin_interval; /* Periodic multicast rejoin interval in seconds
@@ -102,6 +105,10 @@ typedef struct {
   /* Zero-copy settings */
   int zerocopy_on_send; /* Enable zero-copy send with MSG_ZEROCOPY (0=disabled,
                            1=enabled) */
+
+  /* STUN NAT traversal settings */
+  char *rtsp_stun_server; /* STUN server host:port for RTSP NAT traversal
+                             (NULL=disabled) */
 } config_t;
 
 /* GLOBALS */

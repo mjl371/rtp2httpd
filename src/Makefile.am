@@ -20,6 +20,8 @@ rtp2httpd_SOURCES = \
 	fcc_huawei.c \
 	stream.c \
 	rtsp.c \
+	http_proxy.c \
+	stun.c \
 	snapshot.c \
 	timezone.c \
 	status.c \
@@ -52,6 +54,8 @@ noinst_HEADERS = \
 	fcc_huawei.h \
 	stream.h \
 	rtsp.h \
+	http_proxy.h \
+	stun.h \
 	snapshot.h \
 	timezone.h \
 	status.h \

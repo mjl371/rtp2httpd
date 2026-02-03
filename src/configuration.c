@@ -39,6 +39,7 @@ int cmd_upstream_interface_set = 0;
 int cmd_upstream_interface_fcc_set = 0;
 int cmd_upstream_interface_rtsp_set = 0;
 int cmd_upstream_interface_multicast_set = 0;
+int cmd_upstream_interface_http_set = 0;
 int cmd_fcc_listen_port_range_set = 0;
 int cmd_status_page_path_set = 0;
 int cmd_player_page_path_set = 0;
@@ -46,6 +47,7 @@ int cmd_zerocopy_on_send_set = 0;
 int cmd_workers_set = 0;
 int cmd_external_m3u_url_set = 0;
 int cmd_external_m3u_update_interval_set = 0;
+int cmd_rtsp_stun_server_set = 0;
 
 enum section_e { SEC_NONE = 0, SEC_BIND, SEC_SERVICES, SEC_GLOBAL };
 
@@ -512,6 +514,14 @@ void parse_global_sec(char *line) {
     return;
   }
 
+  if (strcasecmp("upstream-interface-http", param) == 0) {
+    if (set_if_not_cmd_override(cmd_upstream_interface_http_set,
+                                "upstream-interface-http")) {
+      strncpy(config.upstream_interface_http, value, IFNAMSIZ - 1);
+    }
+    return;
+  }
+
   if (strcasecmp("mcast-rejoin-interval", param) == 0) {
     if (set_if_not_cmd_override(cmd_mcast_rejoin_interval_set,
                                 "mcast-rejoin-interval")) {
@@ -544,6 +554,18 @@ void parse_global_sec(char *line) {
     config.external_m3u_update_interval = atoi(value);
     logger(LOG_INFO, "External M3U update interval: %d seconds",
            config.external_m3u_update_interval);
+    return;
+  }
+
+  /* STUN NAT traversal configuration */
+  if (strcasecmp("rtsp-stun-server", param) == 0) {
+    if (!cmd_rtsp_stun_server_set) {
+      safe_free_string(&config.rtsp_stun_server);
+      if (value[0] != '\0') {
+        config.rtsp_stun_server = strdup(value);
+        logger(LOG_INFO, "RTSP STUN server: %s", config.rtsp_stun_server);
+      }
+    }
     return;
   }
 
@@ -783,6 +805,8 @@ void config_free(bool force_free) {
   }
   if (!cmd_external_m3u_url_set || force_free)
     safe_free_string(&config.external_m3u_url);
+  if (!cmd_rtsp_stun_server_set || force_free)
+    safe_free_string(&config.rtsp_stun_server);
 
   /* Free bind addresses */
   if (!cmd_bind_set || force_free) {
@@ -843,6 +867,8 @@ void config_init(void) {
     memset(config.upstream_interface_rtsp, 0, IFNAMSIZ);
   if (!cmd_upstream_interface_multicast_set)
     memset(config.upstream_interface_multicast, 0, IFNAMSIZ);
+  if (!cmd_upstream_interface_http_set)
+    memset(config.upstream_interface_http, 0, IFNAMSIZ);
 
   /* External M3U settings (only if not set by command line) */
   if (!cmd_external_m3u_update_interval_set)
@@ -959,6 +985,8 @@ void usage(FILE *f, char *progname) {
       "traffic (overrides -i)\n"
       "\t-r --upstream-interface-multicast <interface>  Interface for "
       "multicast traffic (overrides -i)\n"
+      "\t-y --upstream-interface-http <interface>  Interface for HTTP proxy "
+      "upstream traffic (overrides -i)\n"
       "\t-R --mcast-rejoin-interval <seconds>  Periodic multicast rejoin "
       "interval (0=disabled, default 0)\n"
       "\t-F --ffmpeg-path <path>  Path to ffmpeg executable (default: ffmpeg)\n"
@@ -976,6 +1004,8 @@ void usage(FILE *f, char *progname) {
       "(default: 7200 = 2h, 0=disabled)\n"
       "\t-Z --zerocopy-on-send    Enable zero-copy send with MSG_ZEROCOPY for "
       "better performance (default: off)\n"
+      "\t-N --rtsp-stun-server <host:port>  STUN server for RTSP NAT traversal "
+      "(default: disabled)\n"
       "\t                     default " CONFIGFILE "\n",
       prog);
 }
@@ -1031,6 +1061,7 @@ void parse_cmd_line(int argc, char *argv[]) {
       {"upstream-interface-fcc", required_argument, 0, 'f'},
       {"upstream-interface-rtsp", required_argument, 0, 't'},
       {"upstream-interface-multicast", required_argument, 0, 'r'},
+      {"upstream-interface-http", required_argument, 0, 'y'},
       {"mcast-rejoin-interval", required_argument, 0, 'R'},
       {"ffmpeg-path", required_argument, 0, 'F'},
       {"ffmpeg-args", required_argument, 0, 'A'},
@@ -1040,9 +1071,10 @@ void parse_cmd_line(int argc, char *argv[]) {
       {"external-m3u", required_argument, 0, 'M'},
       {"external-m3u-update-interval", required_argument, 0, 'I'},
       {"zerocopy-on-send", no_argument, 0, 'Z'},
+      {"rtsp-stun-server", required_argument, 0, 'N'},
       {0, 0, 0, 0}};
 
-  const char short_opts[] = "v:qhUm:w:b:B:c:l:P:H:XT:i:f:t:r:R:F:A:s:p:M:I:SCZ";
+  const char short_opts[] = "v:qhUm:w:b:B:c:l:P:H:XT:i:f:t:r:y:R:F:A:s:p:M:I:SCZN:";
   int option_index, opt;
   int configfile_failed = 1;
 
@@ -1171,6 +1203,10 @@ void parse_cmd_line(int argc, char *argv[]) {
       strncpy(config.upstream_interface_multicast, optarg, IFNAMSIZ - 1);
       cmd_upstream_interface_multicast_set = 1;
       break;
+    case 'y':
+      strncpy(config.upstream_interface_http, optarg, IFNAMSIZ - 1);
+      cmd_upstream_interface_http_set = 1;
+      break;
     case 'R':
       if (atoi(optarg) < 0) {
         logger(LOG_ERROR, "Invalid mcast-rejoin-interval! Ignoring.");
@@ -1218,6 +1254,12 @@ void parse_cmd_line(int argc, char *argv[]) {
       config.zerocopy_on_send = 1;
       cmd_zerocopy_on_send_set = 1;
       logger(LOG_INFO, "Zero-copy send enabled (MSG_ZEROCOPY)");
+      break;
+    case 'N':
+      safe_free_string(&config.rtsp_stun_server);
+      config.rtsp_stun_server = strdup(optarg);
+      cmd_rtsp_stun_server_set = 1;
+      logger(LOG_INFO, "RTSP STUN server: %s", config.rtsp_stun_server);
       break;
     default:
       logger(LOG_FATAL, "Unknown option! %d ", opt);
