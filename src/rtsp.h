@@ -107,6 +107,7 @@ typedef enum {
 
 /* RTSP session structure */
 typedef struct {
+  int initialized; /* Flag: session has been initialized with resources */
   int socket;                /* TCP socket to RTSP server */
   int epoll_fd;              /* Epoll file descriptor for socket registration */
   struct connection_s *conn; /* Connection pointer for fdmap registration */
@@ -116,6 +117,8 @@ typedef struct {
   uint32_t cseq;    /* RTSP sequence number */
   char session_id[RTSP_SESSION_ID_SIZE];   /* RTSP session ID */
   char server_url[RTSP_SERVER_URL_SIZE];   /* Full RTSP URL */
+  char setup_url[RTSP_SERVER_URL_SIZE];    /* Resolved SETUP URL (from
+                                              Content-Base + a=control) */
   char server_host[RTSP_SERVER_HOST_SIZE]; /* RTSP server hostname */
   int server_port;                         /* RTSP server port */
   char server_path[RTSP_SERVER_PATH_SIZE]; /* RTSP path with query string */
@@ -182,6 +185,9 @@ typedef struct {
                                 */
   rtsp_state_t state_before_teardown; /* State before TEARDOWN was initiated */
 
+  /* Per-service upstream interface override (resolved at init, non-owning) */
+  const char *upstream_ifname;
+
   /* Buffering */
   uint8_t response_buffer[RTSP_RESPONSE_BUFFER_SIZE]; /* Buffer for RTSP
                                                          responses (control
@@ -231,8 +237,12 @@ int rtsp_connect(rtsp_session_t *session);
  * Handles both RTSP handshake and RTP data in PLAYING state
  * @param session RTSP session
  * @param events Epoll events (EPOLLIN, EPOLLOUT, etc.)
- * @return Number of bytes forwarded to client (>0), 0 if no data forwarded, -1
- * on error
+ * @return Return values:
+ *   >0: Number of bytes forwarded to client
+ *    0: No data forwarded (handshake in progress or no data available)
+ *   -1: Error (socket error, protocol error, connection closed unexpectedly)
+ *   -2: Graceful TEARDOWN completed (not an error, connection should close)
+ *   -3: Duration query completed (r2h-duration request)
  */
 int rtsp_handle_socket_event(rtsp_session_t *session, uint32_t events);
 
@@ -296,8 +306,19 @@ int rtsp_send_keepalive(rtsp_session_t *session);
  * Advance the RTSP state machine to the next state.
  * Called after receiving a response or when STUN completes.
  * @param session RTSP session
- * @return 0 on success, -1 on error
+ * @return Return values:
+ *    0: Success, state machine advanced
+ *   -1: Error (protocol error, failed to prepare request)
+ *   -2: Graceful TEARDOWN completed (not an error, cleanup should proceed)
  */
 int rtsp_state_machine_advance(rtsp_session_t *session);
+
+/**
+ * Periodic tick for RTSP session (STUN timeout, keepalive)
+ * @param session RTSP session
+ * @param now Current timestamp in milliseconds
+ * @return 0 on success
+ */
+int rtsp_session_tick(rtsp_session_t *session, int64_t now);
 
 #endif /* __RTSP_H__ */

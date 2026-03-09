@@ -3,6 +3,7 @@
 #include "connection.h"
 #include <ctype.h>
 #include <stdio.h>
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -20,6 +21,7 @@ static const char *response_codes[] = {
     "HTTP/1.1 500 Internal Server Error\r\n", /* 5 */
     "HTTP/1.1 401 Unauthorized\r\n",          /* 6 */
     "HTTP/1.1 304 Not Modified\r\n",          /* 7 */
+    "HTTP/1.1 204 No Content\r\n",            /* 8 */
 };
 
 void send_http_headers(connection_t *c, http_status_t status,
@@ -61,6 +63,13 @@ void send_http_headers(connection_t *c, http_status_t status,
     c->should_set_r2h_cookie = 0; /* Only set once */
   }
 
+  /* CORS header if configured */
+  if (config.cors_allow_origin && config.cors_allow_origin[0]) {
+    len += snprintf(headers + len, sizeof(headers) - len,
+                    "Access-Control-Allow-Origin: %s\r\n",
+                    config.cors_allow_origin);
+  }
+
   /* Extra headers if provided */
   if (extra_headers && extra_headers[0]) {
     len += snprintf(headers + len, sizeof(headers) - len, "%s", extra_headers);
@@ -68,6 +77,11 @@ void send_http_headers(connection_t *c, http_status_t status,
 
   /* Final CRLF */
   len += snprintf(headers + len, sizeof(headers) - len, "\r\n");
+
+  /* Clamp len: snprintf returns would-be length on truncation, which could
+   * exceed the buffer size and cause connection_queue_output to overread */
+  if (len >= (int)sizeof(headers))
+    len = (int)sizeof(headers) - 1;
 
   connection_queue_output(c, (const uint8_t *)headers, len);
   c->headers_sent = 1;
@@ -98,14 +112,6 @@ int http_url_decode(char *str) {
   return 0;
 }
 
-/**
- * URL encode a string (RFC 3986)
- * Allocates and returns a new string with encoded characters.
- * Unreserved characters (alphanumeric, -, _, ., ~, /) are not encoded.
- *
- * @param str String to encode
- * @return Newly allocated encoded string (caller must free), or NULL on error
- */
 char *http_url_encode(const char *str) {
   static const char hex_chars[] = "0123456789ABCDEF";
   size_t len;
@@ -151,9 +157,6 @@ char *http_url_encode(const char *str) {
   return encoded;
 }
 
-/**
- * Initialize HTTP request structure
- */
 void http_request_init(http_request_t *req) {
   if (!req)
     return;
@@ -165,9 +168,6 @@ void http_request_init(http_request_t *req) {
   req->body_alloc = 0;
 }
 
-/**
- * Cleanup HTTP request structure (free dynamically allocated memory)
- */
 void http_request_cleanup(http_request_t *req) {
   if (!req)
     return;
@@ -179,10 +179,6 @@ void http_request_cleanup(http_request_t *req) {
   req->body_alloc = 0;
 }
 
-/**
- * Parse HTTP request from buffer (incremental parsing)
- * Returns: 0 = need more data, 1 = request complete, -1 = parse error
- */
 int http_parse_request(char *inbuf, int *in_len, http_request_t *req) {
   if (!inbuf || !in_len || !req)
     return -1;
@@ -261,25 +257,55 @@ int http_parse_request(char *inbuf, int *in_len, http_request_t *req) {
         }
 
         /* Save raw headers for proxy forwarding (exclude Host, Connection,
-         * Content-Length, Transfer-Encoding which are handled specially, and
-         * X-Forwarded-* headers which should not be forwarded to upstream) */
+         * Content-Length, Transfer-Encoding which are handled specially,
+         * Accept-Encoding to prevent compressed responses that break rewriting,
+         * and X-Forwarded-* headers which should not be forwarded to upstream).
+         * Cookie and User-Agent are filtered to remove r2h-token before forwarding. */
         if (strcasecmp(inbuf, "Host") != 0 &&
             strcasecmp(inbuf, "Connection") != 0 &&
             strcasecmp(inbuf, "Content-Length") != 0 &&
             strcasecmp(inbuf, "Transfer-Encoding") != 0 &&
+            strcasecmp(inbuf, "Accept-Encoding") != 0 &&
             strcasecmp(inbuf, "X-Forwarded-For") != 0 &&
             strcasecmp(inbuf, "X-Forwarded-Host") != 0 &&
             strcasecmp(inbuf, "X-Forwarded-Proto") != 0) {
-          size_t header_line_len =
-              strlen(inbuf) + 2 + strlen(value) + 2; /* "Name: Value\r\n" */
-          if (req->raw_headers_len + header_line_len <
-              sizeof(req->raw_headers) - 1) {
-            int added =
-                snprintf(req->raw_headers + req->raw_headers_len,
-                         sizeof(req->raw_headers) - req->raw_headers_len,
-                         "%s: %s\r\n", inbuf, value);
-            if (added > 0) {
-              req->raw_headers_len += (size_t)added;
+          const char *filtered_value = value;
+          char filter_buf[2048];
+
+          /* Filter r2h-token from Cookie header */
+          if (strcasecmp(inbuf, "Cookie") == 0 && config.r2h_token &&
+              config.r2h_token[0] != '\0') {
+            int flen = http_filter_cookie(value, "r2h-token", filter_buf,
+                                          sizeof(filter_buf));
+            if (flen > 0) {
+              filtered_value = filter_buf;
+            } else if (flen == 0) {
+              /* Cookie is empty after filtering, skip this header */
+              filtered_value = NULL;
+            }
+          }
+          /* Filter R2HTOKEN/xxx from User-Agent header */
+          else if (strcasecmp(inbuf, "User-Agent") == 0 && config.r2h_token &&
+                   config.r2h_token[0] != '\0') {
+            int flen = http_filter_user_agent_token(value, filter_buf,
+                                                    sizeof(filter_buf));
+            if (flen > 0) {
+              filtered_value = filter_buf;
+            }
+          }
+
+          if (filtered_value && filtered_value[0]) {
+            size_t header_line_len = strlen(inbuf) + 2 + strlen(filtered_value) +
+                                     2; /* "Name: Value\r\n" */
+            if (req->raw_headers_len + header_line_len <
+                sizeof(req->raw_headers) - 1) {
+              int added =
+                  snprintf(req->raw_headers + req->raw_headers_len,
+                           sizeof(req->raw_headers) - req->raw_headers_len,
+                           "%s: %s\r\n", inbuf, filtered_value);
+              if (added > 0) {
+                req->raw_headers_len += (size_t)added;
+              }
             }
           }
         }
@@ -332,10 +358,26 @@ int http_parse_request(char *inbuf, int *in_len, http_request_t *req) {
                   sizeof(req->x_forwarded_proto) - 1);
           req->x_forwarded_proto[sizeof(req->x_forwarded_proto) - 1] = '\0';
         } else if (strcasecmp(inbuf, "Content-Length") == 0) {
-          req->content_length = atoi(value);
+          char *endptr;
+          long cl = strtol(value, &endptr, 10);
+          if (*endptr != '\0' || cl < 0 || cl > INT_MAX) {
+            req->content_length = 0;
+          } else {
+            req->content_length = (int)cl;
+          }
         } else if (strcasecmp(inbuf, "Cookie") == 0) {
           strncpy(req->cookie, value, sizeof(req->cookie) - 1);
           req->cookie[sizeof(req->cookie) - 1] = '\0';
+        } else if (strcasecmp(inbuf, "Access-Control-Request-Method") == 0) {
+          strncpy(req->access_control_request_method, value,
+                  sizeof(req->access_control_request_method) - 1);
+          req->access_control_request_method
+              [sizeof(req->access_control_request_method) - 1] = '\0';
+        } else if (strcasecmp(inbuf, "Access-Control-Request-Headers") == 0) {
+          strncpy(req->access_control_request_headers, value,
+                  sizeof(req->access_control_request_headers) - 1);
+          req->access_control_request_headers
+              [sizeof(req->access_control_request_headers) - 1] = '\0';
         }
       }
 
@@ -418,17 +460,6 @@ static const char *find_query_param(const char *query_string,
   return NULL;
 }
 
-/**
- * Parse query parameter value from query/form string (case-insensitive
- * parameter names) Works for both URL query strings and
- * application/x-www-form-urlencoded body data The returned value is
- * automatically URL-decoded.
- * @param query_string Query or form data string (without leading ?)
- * @param param_name Parameter name to search for (case-insensitive)
- * @param value_buf Buffer to store parameter value (will be URL-decoded)
- * @param value_size Size of value buffer
- * @return 0 if parameter found, -1 if not found or error
- */
 int http_parse_query_param(const char *query_string, const char *param_name,
                            char *value_buf, size_t value_size) {
   const char *param_start, *value_start, *value_end;
@@ -472,14 +503,185 @@ int http_parse_query_param(const char *query_string, const char *param_name,
   return 0;
 }
 
-/**
- * Copy query string excluding a specific parameter (case-insensitive)
- * @param query_string Input query string (without leading '?')
- * @param exclude_param Parameter name to exclude (case-insensitive)
- * @param output Output buffer
- * @param output_size Output buffer size
- * @return Length of output string, or -1 on error
- */
+const char *http_find_url_label(const char *url) {
+  const char *p;
+  size_t len;
+
+  if (!url) {
+    return NULL;
+  }
+
+  len = strlen(url);
+  if (len == 0) {
+    return NULL;
+  }
+
+  /* Search backwards for '$' */
+  p = url + len;
+  while (p > url) {
+    p--;
+    if (*p == '$') {
+      /* '$' at the very end of string (no label text after it) - not a label */
+      if (p[1] == '\0') {
+        continue;
+      }
+      /* '${' is a placeholder pattern, not a label */
+      if (p[1] == '{') {
+        continue;
+      }
+      return p;
+    }
+  }
+
+  return NULL;
+}
+
+void http_strip_url_label(char *url) {
+  const char *label = http_find_url_label(url);
+  if (label) {
+    /* Truncate at the '$' position */
+    url[label - url] = '\0';
+  }
+}
+
+int http_filter_cookie(const char *cookie_header, const char *exclude_name,
+                       char *output, size_t output_size) {
+  if (!cookie_header || !exclude_name || !output || output_size == 0) {
+    return -1;
+  }
+
+  size_t exclude_len = strlen(exclude_name);
+  size_t out_len = 0;
+  const char *pos = cookie_header;
+  int first_cookie = 1;
+
+  output[0] = '\0';
+
+  while (*pos) {
+    /* Skip leading whitespace */
+    while (*pos == ' ' || *pos == '\t')
+      pos++;
+
+    if (*pos == '\0')
+      break;
+
+    /* Find end of current cookie (semicolon or end of string) */
+    const char *cookie_end = strchr(pos, ';');
+    size_t cookie_len = cookie_end ? (size_t)(cookie_end - pos) : strlen(pos);
+
+    /* Check if this cookie matches the one to exclude */
+    int should_exclude = 0;
+    if (cookie_len > exclude_len && pos[exclude_len] == '=' &&
+        strncasecmp(pos, exclude_name, exclude_len) == 0) {
+      should_exclude = 1;
+    }
+
+    if (!should_exclude && cookie_len > 0) {
+      /* Add separator if not first cookie */
+      if (!first_cookie) {
+        if (out_len + 2 >= output_size) {
+          return -1; /* Buffer too small */
+        }
+        output[out_len++] = ';';
+        output[out_len++] = ' ';
+      }
+
+      /* Copy cookie */
+      if (out_len + cookie_len >= output_size) {
+        return -1; /* Buffer too small */
+      }
+      memcpy(output + out_len, pos, cookie_len);
+      out_len += cookie_len;
+      first_cookie = 0;
+    }
+
+    /* Move to next cookie */
+    if (cookie_end) {
+      pos = cookie_end + 1;
+    } else {
+      break;
+    }
+  }
+
+  output[out_len] = '\0';
+  return (int)out_len;
+}
+
+int http_filter_user_agent_token(const char *user_agent, char *output,
+                                 size_t output_size) {
+  if (!user_agent || !output || output_size == 0) {
+    return -1;
+  }
+
+  const char *token_start = strcasestr(user_agent, "R2HTOKEN/");
+  if (!token_start) {
+    /* No token found, copy as-is */
+    size_t len = strlen(user_agent);
+    if (len >= output_size) {
+      return -1;
+    }
+    memcpy(output, user_agent, len + 1);
+    return (int)len;
+  }
+
+  /* Find end of token (space or end of string) */
+  const char *token_end = token_start + 9; /* Skip "R2HTOKEN/" */
+  while (*token_end && *token_end != ' ' && *token_end != '\t')
+    token_end++;
+
+  /* Determine if there's a space before and after the token.
+   * We want to remove exactly one space to avoid double spaces or missing spaces.
+   * If token is at start: "R2HTOKEN/xxx suffix" -> "suffix"
+   * If token is at end: "prefix R2HTOKEN/xxx" -> "prefix"
+   * If token is in middle: "prefix R2HTOKEN/xxx suffix" -> "prefix suffix"
+   */
+  int has_leading_space =
+      (token_start > user_agent &&
+       (*(token_start - 1) == ' ' || *(token_start - 1) == '\t'));
+  int has_trailing_space = (*token_end == ' ' || *token_end == '\t');
+
+  /* Determine prefix end point */
+  const char *prefix_end = token_start;
+  if (has_leading_space && has_trailing_space) {
+    /* Token in middle: remove leading space, keep trailing space */
+    prefix_end--;
+  } else if (has_leading_space) {
+    /* Token at end: remove leading space */
+    prefix_end--;
+  }
+  /* If only trailing space or no spaces: prefix_end stays at token_start */
+
+  /* Determine suffix start point */
+  const char *suffix_start = token_end;
+  if (!has_leading_space && has_trailing_space) {
+    /* Token at start: skip trailing space */
+    suffix_start++;
+  }
+  /* If token in middle or at end: suffix_start stays at token_end */
+
+  /* Calculate output: prefix + suffix */
+  size_t prefix_len = (size_t)(prefix_end - user_agent);
+  size_t suffix_len = strlen(suffix_start);
+  size_t total_len = prefix_len + suffix_len;
+
+  if (total_len >= output_size) {
+    return -1;
+  }
+
+  /* Copy prefix */
+  if (prefix_len > 0) {
+    memcpy(output, user_agent, prefix_len);
+  }
+
+  /* Copy suffix */
+  if (suffix_len > 0) {
+    memcpy(output + prefix_len, suffix_start, suffix_len);
+  }
+
+  output[total_len] = '\0';
+  return (int)total_len;
+}
+
 int http_filter_query_param(const char *query_string, const char *exclude_param,
                             char *output, size_t output_size) {
   if (!query_string || !exclude_param || !output || output_size == 0) {
@@ -535,10 +737,6 @@ int http_filter_query_param(const char *query_string, const char *exclude_param,
   return (int)out_len;
 }
 
-/**
- * Send HTTP 400 Bad Request response
- * @param conn Connection object
- */
 void http_send_400(connection_t *conn) {
   static const char body[] = "<!doctype html><title>400</title>Bad Request";
 
@@ -550,10 +748,6 @@ void http_send_400(connection_t *conn) {
                                     sizeof(body) - 1);
 }
 
-/**
- * Send HTTP 404 Not Found response
- * @param conn Connection object
- */
 void http_send_404(connection_t *conn) {
   static const char body[] = "<!doctype html><title>404</title>Not Found";
 
@@ -565,10 +759,6 @@ void http_send_404(connection_t *conn) {
                                     sizeof(body) - 1);
 }
 
-/**
- * Send HTTP 500 Internal Server Error response
- * @param conn Connection object
- */
 void http_send_500(connection_t *conn) {
   static const char body[] =
       "<!doctype html><title>500</title>Internal Server Error";
@@ -581,10 +771,6 @@ void http_send_500(connection_t *conn) {
                                     sizeof(body) - 1);
 }
 
-/**
- * Send HTTP 503 Service Unavailable response
- * @param conn Connection object
- */
 void http_send_503(connection_t *conn) {
   static const char body[] =
       "<!doctype html><title>503</title>Service Unavailable";
@@ -597,10 +783,6 @@ void http_send_503(connection_t *conn) {
                                     sizeof(body) - 1);
 }
 
-/**
- * Send HTTP 401 Unauthorized response
- * @param conn Connection object
- */
 void http_send_401(connection_t *conn) {
   static const char body[] = "<!doctype html><title>401</title>Unauthorized";
 
@@ -613,15 +795,6 @@ void http_send_401(connection_t *conn) {
                                     sizeof(body) - 1);
 }
 
-/**
- * Parse URL and extract components (protocol, host, port, path)
- * @param url Input URL string
- * @param protocol Output buffer for protocol (can be NULL)
- * @param host Output buffer for host (can be NULL)
- * @param port Output buffer for port (can be NULL)
- * @param path Output buffer for path (can be NULL)
- * @return 0 on success, -1 on error
- */
 int http_parse_url_components(const char *url, char *protocol, char *host,
                               char *port, char *path) {
   const char *p = url;
@@ -730,13 +903,6 @@ int http_parse_url_components(const char *url, char *protocol, char *host,
   return 0;
 }
 
-/**
- * Match Host header against expected hostname
- * @param request_host_header Host header from HTTP request
- * @param expected_host Expected hostname to match against (just the hostname
- * part)
- * @return 1 if match, 0 if not match, -1 on error
- */
 int http_match_host_header(const char *request_host_header,
                            const char *expected_host) {
   char request_hostname[256];

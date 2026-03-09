@@ -1,12 +1,12 @@
 #include "http_fetch.h"
 #include "hashmap.h"
+#include "poller.h"
 #include "utils.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/epoll.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -123,6 +123,27 @@ static http_fetch_tool_t detect_http_fetch_tool(void) {
   return detected_tool;
 }
 
+/* Escape a string for safe embedding in single-quoted shell arguments.
+ * Replaces each ' with '\'' . Returns 0 on success, -1 if output too small. */
+static int shell_escape_single_quote(const char *input, char *output, size_t output_size) {
+  size_t j = 0;
+  for (size_t i = 0; input[i] != '\0'; i++) {
+    if (input[i] == '\'') {
+      if (j + 4 >= output_size) return -1;
+      output[j++] = '\'';
+      output[j++] = '\\';
+      output[j++] = '\'';
+      output[j++] = '\'';
+    } else {
+      if (j + 1 >= output_size) return -1;
+      output[j++] = input[i];
+    }
+  }
+  if (j >= output_size) return -1;
+  output[j] = '\0';
+  return 0;
+}
+
 /* Build fetch command based on available tool */
 static int build_fetch_command(char *buf, size_t bufsize, const char *url,
                                const char *output_file, int timeout) {
@@ -134,22 +155,28 @@ static int build_fetch_command(char *buf, size_t bufsize, const char *url,
     return -1;
   }
 
+  /* Escape single quotes in url to prevent shell injection */
+  char escaped_url[4096];
+  if (shell_escape_single_quote(url, escaped_url, sizeof(escaped_url)) < 0) {
+    return -1;
+  }
+
   if (tool == HTTP_TOOL_CURL) {
     ret = snprintf(buf, bufsize,
                    "curl -L -f -s -S -k --max-time %d --connect-timeout 10 -o "
                    "'%s' '%s' 2>&1; echo \"EXIT_CODE:$?\"",
-                   timeout, output_file, url);
+                   timeout, output_file, escaped_url);
   } else if (tool == HTTP_TOOL_UCLIENT_FETCH) {
     ret = snprintf(buf, bufsize,
                    "uclient-fetch --no-check-certificate -q -T %d -O '%s' '%s' "
                    "2>&1; echo \"EXIT_CODE:$?\"",
-                   timeout, output_file, url);
+                   timeout, output_file, escaped_url);
   } else /* HTTP_TOOL_WGET */
   {
     ret = snprintf(buf, bufsize,
                    "wget --no-check-certificate -q -T %d -O '%s' '%s' 2>&1; "
                    "echo \"EXIT_CODE:$?\"",
-                   timeout, output_file, url);
+                   timeout, output_file, escaped_url);
   }
 
   if (ret >= (int)bufsize) {
@@ -193,9 +220,9 @@ static void http_fetch_free(http_fetch_ctx_t *ctx) {
   if (!ctx)
     return;
 
-  /* Remove from epoll if registered */
+  /* Remove from poller if registered */
   if (ctx->epfd >= 0 && ctx->pipe_fd >= 0) {
-    epoll_ctl(ctx->epfd, EPOLL_CTL_DEL, ctx->pipe_fd, NULL);
+    poller_del(ctx->epfd, ctx->pipe_fd);
   }
 
   /* Close pipe */
@@ -228,7 +255,6 @@ http_fetch_start_async_internal(const char *url, http_fetch_callback_t callback,
   char fetch_cmd[MAX_URL_LENGTH + 256];
   char temp_file_template[] = "/tmp/rtp2httpd_http_fetch_XXXXXX";
   int temp_fd;
-  struct epoll_event ev;
 
   if (!url || (!callback && !fd_callback) || epfd < 0) {
     logger(LOG_ERROR, "Invalid parameters for async HTTP fetch");
@@ -425,13 +451,10 @@ http_fetch_start_async_internal(const char *url, http_fetch_callback_t callback,
   }
   ctx->buffer_used = 0;
 
-  /* Register pipe fd with epoll */
-  memset(&ev, 0, sizeof(ev));
-  ev.events = EPOLLIN | EPOLLHUP | EPOLLERR;
-  ev.data.fd = ctx->pipe_fd;
-
-  if (epoll_ctl(epfd, EPOLL_CTL_ADD, ctx->pipe_fd, &ev) < 0) {
-    logger(LOG_ERROR, "Failed to add async HTTP fetch to epoll: %s",
+  /* Register pipe fd with poller */
+  if (poller_add(epfd, ctx->pipe_fd, POLLER_IN | POLLER_HUP | POLLER_ERR) <
+      0) {
+    logger(LOG_ERROR, "Failed to add async HTTP fetch to poller: %s",
            strerror(errno));
     http_fetch_free(ctx);
     return NULL;

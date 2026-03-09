@@ -3,6 +3,8 @@
 #include "epg.h"
 #include "http.h"
 #include "m3u.h"
+#include "platform_compat.h"
+#include "poller.h"
 #include "service.h"
 #include "status.h"
 #include "utils.h"
@@ -16,7 +18,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -158,16 +159,29 @@ static int extract_r2h_token_from_ua(const char *user_agent, char *value_buf,
  * @return Token source if valid, TOKEN_SOURCE_NONE if not found or invalid
  */
 static token_source_t validate_r2h_token(connection_t *c,
-                                         const char *query_start) {
+                                         const char *query_start,
+                                         const char *raw_query_start) {
   char token_value[256] = {0};
 
-  /* Source 1: URL query parameter (highest priority) */
+  /* Source 1: URL query parameter (highest priority)
+   * Try stripped URL first, then raw URL as fallback in case the configured
+   * token itself contains '$' which would be incorrectly stripped */
   if (query_start) {
     if (http_parse_query_param(query_start + 1, "r2h-token", token_value,
                                sizeof(token_value)) == 0) {
       if (strcmp(token_value, config.r2h_token) == 0) {
         logger(LOG_DEBUG, "r2h-token validated (source: query)");
         return TOKEN_SOURCE_QUERY;
+      }
+      /* Retry with raw (unstripped) query in case token contains '$' */
+      if (raw_query_start && strchr(config.r2h_token, '$')) {
+        char raw_token[256] = {0};
+        if (http_parse_query_param(raw_query_start + 1, "r2h-token", raw_token,
+                                   sizeof(raw_token)) == 0 &&
+            strcmp(raw_token, config.r2h_token) == 0) {
+          logger(LOG_DEBUG, "r2h-token validated (source: query, raw)");
+          return TOKEN_SOURCE_QUERY;
+        }
       }
       logger(LOG_WARN, "r2h-token mismatch (source: query)");
       return TOKEN_SOURCE_NONE;
@@ -358,11 +372,7 @@ int connection_set_tcp_nodelay(int fd) {
 }
 
 void connection_epoll_update_events(int epfd, int fd, uint32_t events) {
-  struct epoll_event ev;
-  memset(&ev, 0, sizeof(ev));
-  ev.events = events;
-  ev.data.fd = fd;
-  epoll_ctl(epfd, EPOLL_CTL_MOD, fd, &ev);
+  poller_mod(epfd, fd, events);
 }
 
 connection_t *connection_create(int fd, int epfd,
@@ -374,6 +384,7 @@ connection_t *connection_create(int fd, int epfd,
   c->fd = fd;
   c->epfd = epfd;
   c->state = CONN_READ_REQ_LINE;
+  platform_set_nosigpipe(fd);
   c->service = NULL;
   c->streaming = 0;
   c->status_index = -1; /* Not registered yet */
@@ -404,12 +415,14 @@ connection_t *connection_create(int fd, int epfd,
   c->slow_candidate_since = 0;
 
   /* Enforce TCP user timeout so unacknowledged data fails quickly */
+#ifdef TCP_USER_TIMEOUT
   int tcp_user_timeout = CONNECTION_TCP_USER_TIMEOUT_MS;
   if (setsockopt(fd, IPPROTO_TCP, TCP_USER_TIMEOUT, &tcp_user_timeout,
                  sizeof(tcp_user_timeout)) < 0) {
     logger(LOG_DEBUG, "connection_create: Failed to set TCP_USER_TIMEOUT: %s",
            strerror(errno));
   }
+#endif
 
   /* Enable SO_ZEROCOPY on socket if supported */
   if (config.zerocopy_on_send) {
@@ -424,7 +437,7 @@ connection_t *connection_create(int fd, int epfd,
   return c;
 }
 
-void connection_free(connection_t *c) {
+void connection_cleanup(connection_t *c) {
   if (!c)
     return;
 
@@ -439,7 +452,7 @@ void connection_free(connection_t *c) {
    * fallback */
   if (c->streaming) {
     logger(LOG_WARN,
-           "connection_free: streaming flag still set, cleaning up stream");
+           "connection_cleanup: streaming flag still set, cleaning up stream");
     stream_context_cleanup(&c->stream);
   }
 
@@ -460,6 +473,7 @@ void connection_free(connection_t *c) {
   /* Unregister from status (only if registered as streaming client) */
   if (c->status_index >= 0) {
     status_unregister_client(c->status_index);
+    c->status_index = -1;
   }
 
   /* Close socket */
@@ -474,9 +488,6 @@ void connection_free(connection_t *c) {
   free(c);
 }
 
-/**
- * Queue data to connection output buffer
- */
 int connection_queue_output(connection_t *c, const uint8_t *data, size_t len) {
   if (!c || !data || len == 0)
     return 0;
@@ -534,7 +545,7 @@ int connection_queue_output_and_flush(connection_t *c, const uint8_t *data,
   if (result < 0)
     return result;
   connection_epoll_update_events(
-      c->epfd, c->fd, EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLHUP | EPOLLERR);
+      c->epfd, c->fd, POLLER_IN | POLLER_OUT | POLLER_RDHUP | POLLER_HUP | POLLER_ERR);
 
   if (c) {
     c->state = CONN_CLOSING;
@@ -549,84 +560,105 @@ connection_write_status_t connection_handle_write(connection_t *c) {
 
   if (!c->zc_queue.head) {
     connection_epoll_update_events(c->epfd, c->fd,
-                                   EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR);
+                                   POLLER_IN | POLLER_RDHUP | POLLER_HUP | POLLER_ERR);
     connection_report_queue(c);
     if (c->state == CONN_CLOSING && !c->zc_queue.pending_head)
       return CONNECTION_WRITE_CLOSED;
     return CONNECTION_WRITE_IDLE;
   }
 
-  size_t bytes_sent = 0;
-  int ret = zerocopy_send(c->fd, &c->zc_queue, &bytes_sent);
+  /* Loop to drain all writable data for edge-triggered pollers where
+   * EPOLLOUT / EV_CLEAR fires only once when the socket becomes writable. */
+  for (;;) {
+    size_t bytes_sent = 0;
+    int ret = zerocopy_send(c->fd, &c->zc_queue, &bytes_sent);
 
-  if (ret < 0 && ret != -2) {
-    c->state = CONN_CLOSING;
-    connection_epoll_update_events(c->epfd, c->fd,
-                                   EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR);
-    connection_report_queue(c);
-    return CONNECTION_WRITE_CLOSED;
+    if (ret < 0 && ret != -2) {
+      c->state = CONN_CLOSING;
+      connection_epoll_update_events(c->epfd, c->fd,
+                                     POLLER_IN | POLLER_RDHUP | POLLER_HUP | POLLER_ERR);
+      connection_report_queue(c);
+      return CONNECTION_WRITE_CLOSED;
+    }
+
+    if (ret == -2) {
+      /* EAGAIN - socket send buffer full, wait for next writable event */
+      connection_report_queue(c);
+      return CONNECTION_WRITE_BLOCKED;
+    }
+
+    if (!c->zc_queue.head) {
+      /* All data sent - remove POLLER_OUT */
+      connection_epoll_update_events(c->epfd, c->fd,
+                                     POLLER_IN | POLLER_RDHUP | POLLER_HUP | POLLER_ERR);
+      connection_report_queue(c);
+      if (c->state == CONN_CLOSING && !c->zc_queue.pending_head)
+        return CONNECTION_WRITE_CLOSED;
+      return CONNECTION_WRITE_IDLE;
+    }
+
+    /* Guard against spinning if zerocopy_send sent 0 bytes without EAGAIN */
+    if (bytes_sent == 0)
+      break;
   }
 
-  if (ret == -2) {
-    connection_report_queue(c);
-    return CONNECTION_WRITE_BLOCKED;
-  }
-
-  if (c->zc_queue.head) {
-    connection_report_queue(c);
-    return CONNECTION_WRITE_PENDING;
-  }
-
-  connection_epoll_update_events(c->epfd, c->fd,
-                                 EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR);
+  /* Queue still has data but we couldn't make progress */
   connection_report_queue(c);
-
-  if (c->state == CONN_CLOSING && !c->zc_queue.pending_head)
-    return CONNECTION_WRITE_CLOSED;
-
-  return CONNECTION_WRITE_IDLE;
+  return CONNECTION_WRITE_PENDING;
 }
 
 void connection_handle_read(connection_t *c) {
   if (!c)
     return;
 
-  /* Read into input buffer */
-  if (c->in_len < INBUF_SIZE) {
-    int r = read(c->fd, c->inbuf + c->in_len, INBUF_SIZE - c->in_len);
-    if (r > 0) {
-      c->in_len += r;
-    } else if (r == 0) {
-      c->state = CONN_CLOSING;
-      return;
-    } else if (errno == EAGAIN) {
-      return;
-    } else {
-      c->state = CONN_CLOSING;
-      return;
+  /* Read into input buffer.  Loop to drain all available data for
+   * edge-triggered pollers (epoll EPOLLET / kqueue EV_CLEAR) where the read event fires
+   * only once per data arrival.  This is important for POST requests
+   * with bodies larger than INBUF_SIZE. */
+  for (;;) {
+    if (c->in_len < INBUF_SIZE) {
+      int r = read(c->fd, c->inbuf + c->in_len, INBUF_SIZE - c->in_len);
+      if (r > 0) {
+        c->in_len += r;
+      } else if (r == 0) {
+        c->state = CONN_CLOSING;
+        return;
+      } else if (errno == EAGAIN) {
+        return; /* No more data available */
+      } else {
+        c->state = CONN_CLOSING;
+        return;
+      }
     }
-  }
 
-  /* Parse HTTP request using http.c parser */
-  if (c->state == CONN_READ_REQ_LINE || c->state == CONN_READ_HEADERS) {
-    int parse_result = http_parse_request(c->inbuf, &c->in_len, &c->http_req);
-    if (parse_result == 1) {
-      /* Request complete, route it */
-      c->state = CONN_ROUTE;
-      connection_route_and_start(c);
-      return;
-    } else if (parse_result < 0) {
-      /* Parse error */
-      c->state = CONN_CLOSING;
-      return;
+    /* Parse HTTP request using http.c parser */
+    if (c->state == CONN_READ_REQ_LINE || c->state == CONN_READ_HEADERS) {
+      int parse_result =
+          http_parse_request(c->inbuf, &c->in_len, &c->http_req);
+      if (parse_result == 1) {
+        /* Request complete, route it */
+        c->state = CONN_ROUTE;
+        connection_route_and_start(c);
+        return;
+      } else if (parse_result < 0) {
+        /* Parse error */
+        c->state = CONN_CLOSING;
+        return;
+      }
+      /* else parse_result == 0: need more data, keep reading */
+    } else {
+      return; /* Not in a request-reading state */
     }
-    /* else parse_result == 0: need more data, continue reading */
   }
 }
 
 int connection_route_and_start(connection_t *c) {
-  /* Ensure URL begins with '/' */
-  const char *url = c->http_req.url;
+  /* Copy URL and strip $label suffix (UI display tag at URL end) */
+  char url_buf[HTTP_URL_BUFFER_SIZE];
+  strncpy(url_buf, c->http_req.url, sizeof(url_buf) - 1);
+  url_buf[sizeof(url_buf) - 1] = '\0';
+  http_strip_url_label(url_buf);
+  const char *url = url_buf;
 
   /* Format client address string (will be overridden by X-Forwarded-For if
    * present later) */
@@ -702,6 +734,31 @@ int connection_route_and_start(connection_t *c) {
     logger(LOG_DEBUG, "Host header validated: %s", c->http_req.hostname);
   }
 
+  /* Handle CORS preflight (OPTIONS) before r2h-token check */
+  if (config.cors_allow_origin && config.cors_allow_origin[0] &&
+      strcasecmp(c->http_req.method, "OPTIONS") == 0) {
+    char cors_headers[1024];
+    int clen = 0;
+
+    clen += snprintf(cors_headers + clen, sizeof(cors_headers) - clen,
+                     "Access-Control-Allow-Methods: %s\r\n",
+                     c->http_req.access_control_request_method[0]
+                         ? c->http_req.access_control_request_method
+                         : "GET, HEAD, OPTIONS");
+    if (c->http_req.access_control_request_headers[0]) {
+      clen += snprintf(cors_headers + clen, sizeof(cors_headers) - clen,
+                       "Access-Control-Allow-Headers: %s\r\n",
+                       c->http_req.access_control_request_headers);
+    }
+    clen += snprintf(cors_headers + clen, sizeof(cors_headers) - clen,
+                     "Access-Control-Max-Age: 86400\r\n"
+                     "Content-Length: 0\r\n");
+
+    send_http_headers(c, STATUS_204, NULL, cors_headers);
+    connection_queue_output_and_flush(c, NULL, 0);
+    return 0;
+  }
+
   /* Extract service_path and query */
   const char *service_path = url + 1; /* skip leading '/' */
   const char *query_start = strchr(service_path, '?');
@@ -727,7 +784,8 @@ int connection_route_and_start(connection_t *c) {
 
   /* Check r2h-token if configured (supports URL query, Cookie, User-Agent) */
   if (config.r2h_token != NULL && config.r2h_token[0] != '\0') {
-    token_source_t source = validate_r2h_token(c, query_start);
+    const char *raw_query_start = strchr(c->http_req.url, '?');
+    token_source_t source = validate_r2h_token(c, query_start, raw_query_start);
     if (source == TOKEN_SOURCE_NONE) {
       http_send_401(c);
       return 0;
@@ -857,6 +915,9 @@ int connection_route_and_start(connection_t *c) {
     return 0;
   }
 
+  /* Strip $label suffix from decoded path (used for UI display only) */
+  http_strip_url_label(decoded_path);
+
   /* Match against configured services using O(1) hashmap lookup */
   service = service_hashmap_get(decoded_path);
 
@@ -870,7 +931,7 @@ int connection_route_and_start(connection_t *c) {
      * present */
     logger(LOG_INFO, "Service matched: %s", service->url);
     service_t *merged_service = service_create_with_query_merge(
-        service, c->http_req.url, service->service_type);
+        service, url, service->service_type);
     if (merged_service) {
       service = merged_service;
     } else {
@@ -890,9 +951,12 @@ int connection_route_and_start(connection_t *c) {
     return 0;
   }
 
-  /* Handle HEAD requests for media streams - return success without connecting
-   * upstream */
-  if (strcasecmp(c->http_req.method, "HEAD") == 0) {
+  /* Handle HEAD requests for RTP/RTSP streams - return success without
+   * connecting upstream.  HTTP services forward HEAD to the upstream server
+   * so the real Content-Type (e.g. application/vnd.apple.mpegurl for HLS)
+   * is returned to the client. */
+  if (strcasecmp(c->http_req.method, "HEAD") == 0 &&
+      service->service_type != SERVICE_HTTP) {
     logger(
         LOG_INFO,
         "HEAD request detected, returning success without upstream connection");
@@ -1083,7 +1147,7 @@ int connection_queue_zerocopy(connection_t *c, buffer_ref_t *buf_ref) {
    */
   if (zerocopy_should_flush(&c->zc_queue)) {
     connection_epoll_update_events(
-        c->epfd, c->fd, EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLHUP | EPOLLERR);
+        c->epfd, c->fd, POLLER_IN | POLLER_OUT | POLLER_RDHUP | POLLER_HUP | POLLER_ERR);
   }
 
   return 0;
@@ -1102,7 +1166,7 @@ int connection_queue_file(connection_t *c, int file_fd, off_t file_offset,
 
   /* Always flush immediately for file sends (no batching) */
   connection_epoll_update_events(
-      c->epfd, c->fd, EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLHUP | EPOLLERR);
+      c->epfd, c->fd, POLLER_IN | POLLER_OUT | POLLER_RDHUP | POLLER_HUP | POLLER_ERR);
 
   /* Set connection to closing state after file transfer */
   c->state = CONN_CLOSING;

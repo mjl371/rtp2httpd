@@ -1,11 +1,19 @@
 #include "utils.h"
 #include "configuration.h"
+#include "http.h"
+#include "m3u.h"
+#include "platform_compat.h"
 #include "rtp2httpd.h"
 #include "status.h"
 #include "supervisor.h"
+#include <arpa/inet.h>
+#include <errno.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <time.h>
@@ -116,4 +124,197 @@ int logger(loglevel_t level, const char *format, ...) {
     }
   }
   return r;
+}
+
+void bind_to_upstream_interface(int sock, const char *ifname) {
+  if (ifname && ifname[0] != '\0') {
+    if (platform_bind_to_device(sock, ifname) < 0) {
+      logger(LOG_ERROR, "Failed to bind to upstream interface %s: %s", ifname,
+             strerror(errno));
+    }
+  }
+}
+
+const char *get_upstream_interface_for_fcc(const char *override,
+                                           const char *override_fcc) {
+  /* Priority: override_fcc > override > upstream_interface_fcc >
+   * upstream_interface */
+  if (override_fcc && override_fcc[0] != '\0') {
+    return override_fcc;
+  }
+  if (override && override[0] != '\0') {
+    return override;
+  }
+  if (config.upstream_interface_fcc[0] != '\0') {
+    return config.upstream_interface_fcc;
+  }
+  if (config.upstream_interface[0] != '\0') {
+    return config.upstream_interface;
+  }
+  return NULL;
+}
+
+const char *get_upstream_interface_for_rtsp(const char *override) {
+  /* Priority: override > upstream_interface_rtsp > upstream_interface */
+  if (override && override[0] != '\0') {
+    return override;
+  }
+  if (config.upstream_interface_rtsp[0] != '\0') {
+    return config.upstream_interface_rtsp;
+  }
+  if (config.upstream_interface[0] != '\0') {
+    return config.upstream_interface;
+  }
+  return NULL;
+}
+
+const char *get_upstream_interface_for_multicast(const char *override) {
+  /* Priority: override > upstream_interface_multicast > upstream_interface */
+  if (override && override[0] != '\0') {
+    return override;
+  }
+  if (config.upstream_interface_multicast[0] != '\0') {
+    return config.upstream_interface_multicast;
+  }
+  if (config.upstream_interface[0] != '\0') {
+    return config.upstream_interface;
+  }
+  return NULL;
+}
+
+const char *get_upstream_interface_for_http(const char *override) {
+  /* Priority: override > upstream_interface_http > upstream_interface */
+  if (override && override[0] != '\0') {
+    return override;
+  }
+  if (config.upstream_interface_http[0] != '\0') {
+    return config.upstream_interface_http;
+  }
+  if (config.upstream_interface[0] != '\0') {
+    return config.upstream_interface;
+  }
+  return NULL;
+}
+
+/**
+ * Get local IP address for FCC packets
+ * Priority: upstream_interface_fcc > upstream_interface > first non-loopback IP
+ */
+uint32_t get_local_ip_for_fcc(const char *override, const char *override_fcc) {
+  const char *ifname = get_upstream_interface_for_fcc(override, override_fcc);
+  struct ifaddrs *ifaddr, *ifa;
+  uint32_t local_ip = 0;
+
+  if (getifaddrs(&ifaddr) == -1) {
+    logger(LOG_ERROR, "getifaddrs failed: %s", strerror(errno));
+    return 0;
+  }
+
+  /* If specific interface is configured, get its IP */
+  if (ifname && ifname[0] != '\0') {
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+      if (ifa->ifa_addr == NULL)
+        continue;
+
+      if (ifa->ifa_addr->sa_family == AF_INET &&
+          strcmp(ifa->ifa_name, ifname) == 0) {
+        struct sockaddr_in *addr =
+            (struct sockaddr_in *)(uintptr_t)ifa->ifa_addr;
+        local_ip = ntohl(addr->sin_addr.s_addr);
+        logger(LOG_DEBUG, "FCC: Using local IP from interface %s: %u.%u.%u.%u",
+               ifname, (local_ip >> 24) & 0xFF, (local_ip >> 16) & 0xFF,
+               (local_ip >> 8) & 0xFF, local_ip & 0xFF);
+        break;
+      }
+    }
+  }
+
+  /* Fallback: Get first non-loopback IPv4 address */
+  if (local_ip == 0) {
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+      if (ifa->ifa_addr == NULL)
+        continue;
+
+      if (ifa->ifa_addr->sa_family == AF_INET) {
+        struct sockaddr_in *addr =
+            (struct sockaddr_in *)(uintptr_t)ifa->ifa_addr;
+        uint32_t ip = ntohl(addr->sin_addr.s_addr);
+
+        /* Skip loopback (127.0.0.0/8) */
+        if ((ip >> 24) != 127) {
+          local_ip = ip;
+          logger(
+              LOG_DEBUG,
+              "FCC: Using first non-loopback IP from interface %s: %u.%u.%u.%u",
+              ifa->ifa_name, (local_ip >> 24) & 0xFF, (local_ip >> 16) & 0xFF,
+              (local_ip >> 8) & 0xFF, local_ip & 0xFF);
+          break;
+        }
+      }
+    }
+  }
+
+  freeifaddrs(ifaddr);
+
+  if (local_ip == 0) {
+    logger(LOG_WARN, "FCC: Could not determine local IP address");
+  }
+
+  return local_ip;
+}
+
+char *build_proxy_base_url(const char *host_header, const char *x_forwarded_host,
+                           const char *x_forwarded_proto) {
+  const char *host = NULL;
+  const char *proto = "http";
+  char *base_url = NULL;
+
+  /* Extract protocol from config.hostname if configured */
+  char config_protocol[16] = {0};
+  if (config.hostname && config.hostname[0] != '\0') {
+    /* Parse URL components from config.hostname to extract protocol */
+    if (http_parse_url_components(config.hostname, config_protocol, NULL, NULL,
+                                  NULL) == 0) {
+      /* Successfully parsed - use protocol from config.hostname if present */
+      if (config_protocol[0] != '\0') {
+        proto = config_protocol;
+      }
+    }
+  }
+
+  if (config.xff && x_forwarded_host && x_forwarded_host[0]) {
+    /* Use X-Forwarded-Host when xff is enabled */
+    host = x_forwarded_host;
+    if (x_forwarded_proto && x_forwarded_proto[0]) {
+      /* X-Forwarded-Proto overrides config.hostname protocol */
+      proto = x_forwarded_proto;
+    }
+  } else if (host_header && host_header[0]) {
+    /* Use Host header */
+    host = host_header;
+    /* Apply X-Forwarded-Proto even without X-Forwarded-Host */
+    if (config.xff && x_forwarded_proto && x_forwarded_proto[0]) {
+      proto = x_forwarded_proto;
+    }
+  }
+
+  if (host) {
+    /* Build base URL from host and proto */
+    size_t url_len = strlen(proto) + 3 + strlen(host) + 2; /* proto://host/ */
+    base_url = malloc(url_len);
+    if (!base_url) {
+      logger(LOG_ERROR, "Failed to allocate base URL");
+      return NULL;
+    }
+    snprintf(base_url, url_len, "%s://%s/", proto, host);
+  } else {
+    /* Fallback to get_server_address */
+    base_url = get_server_address();
+    if (!base_url) {
+      logger(LOG_ERROR, "Failed to get server address for base URL");
+      return NULL;
+    }
+  }
+
+  return base_url;
 }

@@ -114,7 +114,9 @@ int fcc_huawei_initialize_and_request(stream_context_t *ctx) {
   int r;
 
   /* Huawei FCC: Send RSR (FMT 5) with local IP and FCC client port */
-  uint32_t local_ip = get_local_ip_for_fcc();
+  service_t *service = ctx->service;
+  uint32_t local_ip =
+      get_local_ip_for_fcc(service->ifname, service->ifname_fcc);
   uint16_t fcc_client_nport = fcc->fcc_client.sin_port;
 
   if (local_ip == 0) {
@@ -151,6 +153,13 @@ int fcc_huawei_initialize_and_request(stream_context_t *ctx) {
 int fcc_huawei_handle_server_response(stream_context_t *ctx, uint8_t *buf,
                                       int buf_len) {
   fcc_session_t *fcc = &ctx->fcc;
+
+  if (buf_len < 2) {
+    logger(LOG_WARN, "FCC (Huawei): response too short for header (%d bytes)",
+           buf_len);
+    return 0;
+  }
+
   uint8_t fmt = buf[0] & 0x1F;
 
   /* Check FMT type and dispatch */
@@ -172,6 +181,13 @@ int fcc_huawei_handle_server_response(stream_context_t *ctx, uint8_t *buf,
   }
 
   /* Handle FMT 6 - Huawei Server Response */
+  if (buf_len < 16) {
+    logger(LOG_WARN,
+           "FCC (Huawei): response too short for result/type fields (%d bytes)",
+           buf_len);
+    return 0;
+  }
+
   uint8_t result_code = buf[12]; // 1 = success
   uint16_t type_be;
   memcpy(&type_be, buf + 14, sizeof(type_be));
@@ -186,7 +202,7 @@ int fcc_huawei_handle_server_response(stream_context_t *ctx, uint8_t *buf,
            "multicast",
            result_code);
     fcc_session_set_state(fcc, FCC_STATE_MCAST_ACTIVE, "Server error");
-    stream_join_mcast_group(ctx);
+    mcast_session_join(&ctx->mcast, ctx);
     return 0;
   }
 
@@ -195,9 +211,18 @@ int fcc_huawei_handle_server_response(stream_context_t *ctx, uint8_t *buf,
     logger(LOG_INFO,
            "FCC (Huawei): Server says no unicast needed, joining multicast");
     fcc_session_set_state(fcc, FCC_STATE_MCAST_ACTIVE, "No unicast needed");
-    stream_join_mcast_group(ctx);
+    mcast_session_join(&ctx->mcast, ctx);
   } else if (type == 2) {
     /* Server will send unicast stream */
+    if (buf_len < 36) {
+      logger(LOG_WARN,
+             "FCC (Huawei): response too short for unicast fields (%d bytes)",
+             buf_len);
+      fcc_session_set_state(fcc, FCC_STATE_MCAST_ACTIVE, "Short response");
+      mcast_session_join(&ctx->mcast, ctx);
+      return 0;
+    }
+
     uint8_t nat_flag = buf[24];
     uint8_t need_nat_traversal = (nat_flag << 2) >> 7; // Extract bit 5
     uint16_t server_port_be;
@@ -205,8 +230,8 @@ int fcc_huawei_handle_server_response(stream_context_t *ctx, uint8_t *buf,
     uint32_t server_ip_be;
     memcpy(&server_ip_be, buf + 32, sizeof(server_ip_be));
 
-    /* Check if server supports NAT traversal */
-    if (buf_len > 28) {
+    /* Extract session ID for NAT traversal */
+    {
       uint32_t session_id_be;
       memcpy(&session_id_be, buf + 28, sizeof(session_id_be));
       fcc->session_id = ntohl(session_id_be);
@@ -254,13 +279,22 @@ int fcc_huawei_handle_server_response(stream_context_t *ctx, uint8_t *buf,
     logger(LOG_DEBUG, "FCC (Huawei): Waiting for unicast stream");
   } else if (type == 3) {
     /* Redirect to new server */
+    if (buf_len < 36) {
+      logger(LOG_WARN,
+             "FCC (Huawei): response too short for redirect fields (%d bytes)",
+             buf_len);
+      fcc_session_set_state(fcc, FCC_STATE_MCAST_ACTIVE, "Short response");
+      mcast_session_join(&ctx->mcast, ctx);
+      return 0;
+    }
+
     fcc->redirect_count++;
     if (fcc->redirect_count > FCC_MAX_REDIRECTS) {
       logger(LOG_WARN,
              "FCC (Huawei): Too many redirects (%d), falling back to multicast",
              fcc->redirect_count);
       fcc_session_set_state(fcc, FCC_STATE_MCAST_ACTIVE, "Too many redirects");
-      stream_join_mcast_group(ctx);
+      mcast_session_join(&ctx->mcast, ctx);
       return 0;
     }
 
@@ -287,7 +321,7 @@ int fcc_huawei_handle_server_response(stream_context_t *ctx, uint8_t *buf,
            "FCC (Huawei): Unsupported type=%u, falling back to multicast",
            type);
     fcc_session_set_state(fcc, FCC_STATE_MCAST_ACTIVE, "Unsupported type");
-    stream_join_mcast_group(ctx);
+    mcast_session_join(&ctx->mcast, ctx);
   }
 
   return 0;

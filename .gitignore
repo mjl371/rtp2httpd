@@ -1,52 +1,26 @@
-Makefile
-rtp2httpd
-!openwrt-support/rtp2httpd
-!openwrt-support/rtp2httpd/Makefile
-!openwrt-support/luci-app-rtp2httpd/Makefile
-*.o
-# Automake/autoconf generated files
-Makefile.in
-*.pc
-config.*
-stamp-h1
-.deps
-autom4te.cache
-aclocal.m4
-compile
-configure
-configure~
-depcomp
-install-sh
-missing
-.dirstamp
-
-# Test framework files
-test-driver
-
-# Test generated files
-tests/check_*
-!tests/check_*.c
-tests/*.log
-tests/*.trs
-tests/test-suite.log
-*-check_*.o
+.vscode/
 
 # clangd
 .cache/
 compile_commands.json
 
 # Build directories
-build-*-static/
+build/
+build-*/
 
 # Toolchain directory (auto-downloaded)
 toolchain/
 
-# Web UI
-web-ui/node_modules/
+node_modules/
 web-ui/dist/
+docs/.vitepress/dist/
+docs/.vitepress/cache/
 
 # python
 __pycache__/
+*.pyc
+.venv/
+.pytest_cache/
 
 # Benchmark results
 tools/benchmark_results_*.txt

@@ -123,39 +123,37 @@ cd "$BUILD_DIR"
 echo ""
 echo_step "Configuring Build"
 echo_info "Build directory: $(pwd)"
-echo_info "Optimization level: -O3 (optimize for performance)"
+echo_info "Build type: Release (with aggressive optimizations)"
 if [ -n "$RELEASE_VERSION" ]; then
     echo_info "Version: $RELEASE_VERSION"
 fi
 
-# Configure with static linking
+# Configure with CMake for static linking
 # Key flags:
 # -static: Create fully static binary
 # -O3: Optimize for performance
 # --sysroot: Use musl sysroot
-# -ffunction-sections -fdata-sections: Allow linker to remove unused code
-# -Wl,--gc-sections: Remove unused sections
-# -Wl,-s: Strip symbols (smaller binary)
-RELEASE_VERSION="${RELEASE_VERSION}" "${PROJECT_ROOT}/configure" \
-    --host=${TOOLCHAIN_PREFIX} \
-    --prefix=/usr \
-    --sysconfdir=/etc \
-    CC="${TOOLCHAIN_PREFIX}-gcc" \
-    AR="${TOOLCHAIN_PREFIX}-ar" \
-    RANLIB="${TOOLCHAIN_PREFIX}-ranlib" \
-    STRIP="${TOOLCHAIN_PREFIX}-strip" \
-    CFLAGS="-static --sysroot=${SYSROOT}" \
-    LDFLAGS="-static --sysroot=${SYSROOT}" \
-    --enable-optimization=-O3
+RELEASE_VERSION="${RELEASE_VERSION}" cmake "${PROJECT_ROOT}" \
+    -DCMAKE_C_COMPILER="${TOOLCHAIN_PREFIX}-gcc" \
+    -DCMAKE_AR="${TOOLCHAIN_DIR}/bin/${TOOLCHAIN_PREFIX}-ar" \
+    -DCMAKE_RANLIB="${TOOLCHAIN_DIR}/bin/${TOOLCHAIN_PREFIX}-ranlib" \
+    -DCMAKE_STRIP="${TOOLCHAIN_DIR}/bin/${TOOLCHAIN_PREFIX}-strip" \
+    -DCMAKE_C_FLAGS="-static --sysroot=${SYSROOT}" \
+    -DCMAKE_EXE_LINKER_FLAGS="-static --sysroot=${SYSROOT}" \
+    -DCMAKE_INSTALL_PREFIX=/usr \
+    -DCMAKE_INSTALL_SYSCONFDIR=/etc \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DENABLE_AGGRESSIVE_OPT=ON \
+    -DCMAKE_SYSTEM_NAME=Linux
 
 echo ""
 echo_step "Building"
-make -j$(nproc)
+cmake --build . -j$(nproc)
 
 echo ""
 echo_step "Installing to dist directory"
 DIST_DIR="$(pwd)/dist"
-DESTDIR="${DIST_DIR}" make install-strip
+DESTDIR="${DIST_DIR}" cmake --install . --strip
 echo_info "Files installed to: ${DIST_DIR}"
 
 echo ""
@@ -188,18 +186,12 @@ else
 fi
 
 echo ""
-echo_info "Checking for musl libc..."
-if strings "$BINARY" | grep -q "musl"; then
-    echo_info "✓ Binary contains musl libc"
-fi
-
-echo ""
 echo_step "=== Build Summary ==="
 echo_info "Binary: ${BINARY}"
 echo_info "Size: $(stat -c%s "$BINARY" | numfmt --to=iec-i --suffix=B 2>/dev/null || stat -f%z "$BINARY" 2>/dev/null || echo "unknown")"
 echo_info "Architecture: ${TOOLCHAIN_PREFIX%%-*}"
 echo_info "Libc: musl (static)"
-echo_info "Optimization: -O3 (performance)"
+echo_info "Optimization: Release + aggressive"
 echo_info "Toolchain: ${TOOLCHAIN_PREFIX} (${TOOLCHAIN_RELEASE})"
 if [ -n "$RELEASE_VERSION" ]; then
     echo_info "Version: $RELEASE_VERSION"

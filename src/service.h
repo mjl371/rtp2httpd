@@ -2,6 +2,7 @@
 #define SERVICE_H
 
 #include <netdb.h>
+#include <stdint.h>
 
 /* ========== HTTP/SERVICE BUFFER SIZE CONFIGURATION ========== */
 
@@ -63,6 +64,8 @@ typedef struct service_s {
   int seek_offset_seconds; /* Additional offset in seconds from r2h-seek-offset
                               parameter */
   char *user_agent;        /* User-Agent header for timezone detection */
+  char *ifname;     /* Per-service upstream interface override (from r2h-ifname) */
+  char *ifname_fcc; /* Per-service FCC interface override (from r2h-ifname-fcc) */
   struct service_s *next;
 } service_t;
 
@@ -118,6 +121,36 @@ service_t *service_create_from_rtp_url(const char *http_url);
  * @return Pointer to newly allocated service structure or NULL on failure
  */
 service_t *service_create_from_http_url(const char *http_url);
+
+/**
+ * Extract seek parameters (r2h-seek-name, r2h-seek-offset, and the seek
+ * parameter itself) from a URL query string, removing them in-place.
+ *
+ * @param query_start Pointer to the '?' in the URL (modified in-place)
+ * @param out_seek_param_name Output: malloc'd seek parameter name (caller frees)
+ * @param out_seek_param_value Output: malloc'd seek parameter value (caller
+ * frees)
+ * @param out_seek_offset_seconds Output: seek offset in seconds
+ * @return 0 on success, -1 on failure
+ */
+int service_extract_seek_params(char *query_start, char **out_seek_param_name,
+                                char **out_seek_param_value,
+                                int *out_seek_offset_seconds);
+
+/**
+ * Convert seek parameter value with timezone and offset.
+ * Handles "begin-end", "begin-", and "begin" formats.
+ *
+ * @param seek_param_value The seek parameter value to convert
+ * @param tz_offset_seconds Timezone offset in seconds from UTC
+ * @param seek_offset_seconds Additional seek offset in seconds
+ * @param output Output buffer for converted value
+ * @param output_size Size of output buffer
+ * @return 0 on success, -1 on failure
+ */
+int service_convert_seek_value(const char *seek_param_value,
+                               int tz_offset_seconds, int seek_offset_seconds,
+                               char *output, size_t output_size);
 
 /**
  * Create service from configured service with query parameter merging

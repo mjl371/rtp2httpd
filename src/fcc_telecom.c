@@ -1,4 +1,5 @@
 #include "fcc_telecom.h"
+#include "multicast.h"
 #include "service.h"
 #include "stream.h"
 #include "utils.h"
@@ -89,13 +90,31 @@ int fcc_telecom_initialize_and_request(stream_context_t *ctx) {
   return 0;
 }
 
-int fcc_telecom_handle_server_response(stream_context_t *ctx, uint8_t *buf) {
+int fcc_telecom_handle_server_response(stream_context_t *ctx, uint8_t *buf,
+                                       size_t buf_len) {
+  /* Minimum RTCP header: V/P/FMT(1) + PT(1) + Length(2) + SSRC(4) = 8 bytes,
+   * but we also need media SSRC at offset 8, so require at least 12 bytes */
+  if (buf_len < 12) {
+    logger(LOG_WARN, "FCC Telecom: response too short (%zu bytes)", buf_len);
+    return 0;
+  }
+
   fcc_session_t *fcc = &ctx->fcc;
   uint8_t fmt = buf[0] & 0x1F;
 
   /* Check FMT type and dispatch */
-  if (fmt == FCC_FMT_TELECOM_RESP) {
-    /* FMT 3 - Server Response */
+  if (fmt == FCC_FMT_TELECOM_SYN) {
+    /* FMT 4 - Sync notification (12 bytes is sufficient) */
+    return fcc_handle_sync_notification(ctx, 0);
+  } else if (fmt == FCC_FMT_TELECOM_RESP) {
+    /* FMT 3 - Server Response: needs FCI fields up to offset 35 */
+    if (buf_len < 36) {
+      logger(LOG_WARN,
+             "FCC Telecom: FMT 3 response too short (%zu bytes, need 36)",
+             buf_len);
+      return 0;
+    }
+
     if (fcc->state != FCC_STATE_REQUESTED)
       return 0;
 
@@ -103,9 +122,6 @@ int fcc_telecom_handle_server_response(stream_context_t *ctx, uint8_t *buf) {
       logger(LOG_DEBUG, "FCC (Telecom): Unrecognized payload type: %u", buf[1]);
       return 0;
     }
-  } else if (fmt == FCC_FMT_TELECOM_SYN) {
-    /* FMT 4 - Sync notification */
-    return fcc_handle_sync_notification(ctx, 0);
   } else {
     logger(LOG_DEBUG, "FCC (Telecom): Unrecognized FMT: %u", fmt);
     return 0;
@@ -163,7 +179,7 @@ int fcc_telecom_handle_server_response(stream_context_t *ctx, uint8_t *buf) {
            "multicast",
            result_code);
     fcc_session_set_state(fcc, FCC_STATE_MCAST_ACTIVE, "Server error");
-    stream_join_mcast_group(ctx);
+    mcast_session_join(&ctx->mcast, ctx);
     return 0;
   }
 
@@ -201,7 +217,7 @@ int fcc_telecom_handle_server_response(stream_context_t *ctx, uint8_t *buf) {
     logger(LOG_INFO,
            "FCC (Telecom): Server says no unicast needed, joining multicast");
     fcc_session_set_state(fcc, FCC_STATE_MCAST_ACTIVE, "No unicast needed");
-    stream_join_mcast_group(ctx);
+    mcast_session_join(&ctx->mcast, ctx);
   } else if (type == 2) {
     /* Normal FCC flow - server will start unicast stream */
     if (media_port_changed && fcc->media_port) {
@@ -230,7 +246,7 @@ int fcc_telecom_handle_server_response(stream_context_t *ctx, uint8_t *buf) {
           "FCC (Telecom): Too many redirects (%d), falling back to multicast",
           fcc->redirect_count);
       fcc_session_set_state(fcc, FCC_STATE_MCAST_ACTIVE, "Too many redirects");
-      stream_join_mcast_group(ctx);
+      mcast_session_join(&ctx->mcast, ctx);
       return 0;
     }
     logger(LOG_DEBUG,
@@ -245,7 +261,7 @@ int fcc_telecom_handle_server_response(stream_context_t *ctx, uint8_t *buf) {
            "FCC (Telecom): Unsupported type=%u, falling back to multicast",
            type);
     fcc_session_set_state(fcc, FCC_STATE_MCAST_ACTIVE, "Unsupported type");
-    stream_join_mcast_group(ctx);
+    mcast_session_join(&ctx->mcast, ctx);
   }
 
   return 0;

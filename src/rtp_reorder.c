@@ -9,19 +9,64 @@
 #include <stdlib.h>
 #include <string.h>
 
-void rtp_reorder_init(rtp_reorder_t *r) { memset(r, 0, sizeof(*r)); }
+int rtp_reorder_init(rtp_reorder_t *r, int use_fec) {
+  memset(r, 0, sizeof(*r));
+
+  /* Select window size based on FEC usage */
+  if (use_fec) {
+    r->window_size = RTP_REORDER_WINDOW_SIZE_LARGE;
+    r->window_mask = RTP_REORDER_WINDOW_MASK_LARGE;
+  } else {
+    r->window_size = RTP_REORDER_WINDOW_SIZE_SMALL;
+    r->window_mask = RTP_REORDER_WINDOW_MASK_SMALL;
+  }
+
+  /* Allocate slot arrays */
+  r->slots = calloc(r->window_size, sizeof(buffer_ref_t *));
+  if (!r->slots) {
+    return -1;
+  }
+
+  r->seq = calloc(r->window_size, sizeof(uint16_t));
+  if (!r->seq) {
+    free(r->slots);
+    r->slots = NULL;
+    return -1;
+  }
+
+  r->initialized = 1;
+  /* phase starts at 0, transitions to 1 (collecting) then 2 (active)
+   * when packets arrive */
+  return 0;
+}
 
 void rtp_reorder_cleanup(rtp_reorder_t *r)
 {
-  for (int i = 0; i < RTP_REORDER_WINDOW_SIZE; i++)
-  {
-    if (r->slots[i])
-    {
-      buffer_ref_put(r->slots[i]);
-      r->slots[i] = NULL;
-    }
+  /* Skip if never initialized */
+  if (!r->initialized) {
+    return;
   }
+
+  if (r->slots) {
+    for (int i = 0; i < r->window_size; i++)
+    {
+      if (r->slots[i])
+      {
+        buffer_ref_put(r->slots[i]);
+        r->slots[i] = NULL;
+      }
+    }
+    free(r->slots);
+    r->slots = NULL;
+  }
+
+  if (r->seq) {
+    free(r->seq);
+    r->seq = NULL;
+  }
+
   r->count = 0;
+  r->phase = 0;
   r->initialized = 0;
 }
 
@@ -68,7 +113,7 @@ static int flush_consecutive(rtp_reorder_t *r, connection_t *conn,
 
   while (r->count > 0)
   {
-    int slot = r->base_seq & RTP_REORDER_WINDOW_MASK;
+    int slot = r->base_seq & r->window_mask;
     buffer_ref_t *buf = r->slots[slot];
 
     if (!buf)
@@ -121,9 +166,9 @@ static int force_flush_until(rtp_reorder_t *r, uint16_t target_seq,
   int lost_count = 0;
   uint16_t start_seq = r->base_seq;
 
-  while ((int16_t)(target_seq - r->base_seq) >= RTP_REORDER_WINDOW_SIZE)
+  while ((int16_t)(target_seq - r->base_seq) >= r->window_size)
   {
-    int slot = r->base_seq & RTP_REORDER_WINDOW_MASK;
+    int slot = r->base_seq & r->window_mask;
     buffer_ref_t *buf = r->slots[slot];
 
     if (buf)
@@ -163,13 +208,13 @@ int rtp_reorder_insert(rtp_reorder_t *r, buffer_ref_t *buf_ref, uint16_t seqn,
   int total_bytes = 0;
 
   /* Phase 0: First packet - start collecting */
-  if (unlikely(r->initialized == 0))
+  if (unlikely(r->phase == 0))
   {
     r->base_seq = seqn; /* Remember first seq as reference */
-    r->initialized = 1; /* Enter collecting phase */
+    r->phase = 1; /* Enter collecting phase */
 
     /* Store first packet */
-    int slot = seqn & RTP_REORDER_WINDOW_MASK;
+    int slot = seqn & r->window_mask;
     buffer_ref_get(buf_ref);
     r->slots[slot] = buf_ref;
     r->seq[slot] = seqn;
@@ -179,9 +224,9 @@ int rtp_reorder_insert(rtp_reorder_t *r, buffer_ref_t *buf_ref, uint16_t seqn,
 
   /* Phase 1: Collecting initial packets
    * base_seq dynamically tracks the minimum sequence seen so far */
-  if (unlikely(r->initialized == 1))
+  if (unlikely(r->phase == 1))
   {
-    int slot = seqn & RTP_REORDER_WINDOW_MASK;
+    int slot = seqn & r->window_mask;
 
     if (!r->slots[slot])
     {
@@ -200,7 +245,7 @@ int rtp_reorder_insert(rtp_reorder_t *r, buffer_ref_t *buf_ref, uint16_t seqn,
     /* Collected enough? Start delivering from base_seq */
     if (r->count >= RTP_REORDER_INIT_COLLECT)
     {
-      r->initialized = 2; /* Enter active phase */
+      r->phase = 2; /* Enter active phase */
 
       logger(LOG_DEBUG,
              "RTP reorder: Init complete, base_seq=%u (%d packets collected)",
@@ -213,13 +258,13 @@ int rtp_reorder_insert(rtp_reorder_t *r, buffer_ref_t *buf_ref, uint16_t seqn,
     return total_bytes;
   }
 
-  /* Phase 2: Active reordering (initialized == 2) */
+  /* Phase 2: Active reordering (phase == 2) */
   int16_t seq_diff = (int16_t)(seqn - r->base_seq);
 
   /* Case 1: Expected sequence -> store and flush */
   if (likely(seq_diff == 0))
   {
-    int slot = seqn & RTP_REORDER_WINDOW_MASK;
+    int slot = seqn & r->window_mask;
     if (r->slots[slot])
     {
       /* Old packet from ring wrap-around, release it */
@@ -241,13 +286,13 @@ int rtp_reorder_insert(rtp_reorder_t *r, buffer_ref_t *buf_ref, uint16_t seqn,
   }
 
   /* Case 3: Beyond window -> force flush */
-  if (seq_diff >= RTP_REORDER_WINDOW_SIZE)
+  if (seq_diff >= r->window_size)
   {
     total_bytes += force_flush_until(r, seqn, conn, is_snapshot, fec);
   }
 
   /* Store in slot */
-  int slot = seqn & RTP_REORDER_WINDOW_MASK;
+  int slot = seqn & r->window_mask;
   if (r->slots[slot])
   {
     if (r->seq[slot] == seqn)
@@ -301,7 +346,7 @@ int rtp_reorder_insert(rtp_reorder_t *r, buffer_ref_t *buf_ref, uint16_t seqn,
 
 buffer_ref_t *rtp_reorder_get(rtp_reorder_t *r, uint16_t seq)
 {
-  int slot = seq & RTP_REORDER_WINDOW_MASK;
+  int slot = seq & r->window_mask;
   if (r->slots[slot] && r->seq[slot] == seq)
   {
     return r->slots[slot];
@@ -314,7 +359,7 @@ void rtp_reorder_release_range(rtp_reorder_t *r, uint16_t begin_seq,
 {
   for (uint16_t seq = begin_seq;; seq++)
   {
-    int slot = seq & RTP_REORDER_WINDOW_MASK;
+    int slot = seq & r->window_mask;
     if (r->slots[slot] && r->seq[slot] == seq)
     {
       buffer_ref_put(r->slots[slot]);

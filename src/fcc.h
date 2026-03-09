@@ -45,6 +45,7 @@ typedef enum {
 
 /* FCC Session Context - encapsulates all FCC-related state */
 typedef struct {
+  int initialized; /* Flag: session has been initialized with resources */
   fcc_state_t state;
   fcc_type_t type;  /* FCC protocol type (Telecom or Huawei) */
   int status_index; /* Index in status_shared->clients array for state updates
@@ -60,6 +61,8 @@ typedef struct {
   int redirect_count;         /* Number of redirects followed */
   int64_t unicast_start_time; /* Timestamp when unicast started (for sync wait
                                  timeout) */
+  int64_t last_data_time;     /* Timestamp of last received FCC data for timeout
+                                 detection */
 
   /* Huawei FCC specific fields */
   uint32_t session_id;        /* Session ID for NAT traversal correlation */
@@ -101,6 +104,24 @@ void fcc_session_init(fcc_session_t *fcc);
 void fcc_session_cleanup(fcc_session_t *fcc, service_t *service, int epoll_fd);
 
 /**
+ * Periodic tick for FCC session (timeout checks)
+ *
+ * @param ctx Stream context (needed for multicast join on fallback)
+ * @param now Current timestamp in milliseconds
+ * @return 0 on success, -1 if connection should be closed
+ */
+int fcc_session_tick(stream_context_t *ctx, int64_t now);
+
+/**
+ * Handle FCC socket events (receive and process packets)
+ *
+ * @param ctx Stream context
+ * @param now Current timestamp in milliseconds
+ * @return 0 on success, -1 on error
+ */
+int fcc_handle_socket_event(stream_context_t *ctx, int64_t now);
+
+/**
  * Set FCC session state with logging and status update
  *
  * @param fcc FCC session structure
@@ -129,7 +150,10 @@ int fcc_initialize_and_request(stream_context_t *ctx);
  * @param ctx Stream context
  * @param buf Response buffer
  * @param buf_len Buffer length
- * @return 0 on success, -1 for fallback to multicast, 1 for state restart
+ * @return Return values:
+ *    0: Success, FCC accepted by server
+ *    1: State restart needed (redirect to different server)
+ *   -1: Fallback to multicast (FCC rejected or unsupported)
  */
 int fcc_handle_server_response(stream_context_t *ctx, uint8_t *buf,
                                int buf_len);
@@ -139,7 +163,7 @@ int fcc_handle_server_response(stream_context_t *ctx, uint8_t *buf,
  *
  * @param ctx Stream context
  * @param timeout_ms If non-zero, indicates this is called due to timeout
- * @return 0 on success
+ * @return 0 on success (multicast join initiated)
  */
 int fcc_handle_sync_notification(stream_context_t *ctx, int timeout_ms);
 
@@ -148,25 +172,27 @@ int fcc_handle_sync_notification(stream_context_t *ctx, int timeout_ms);
  *
  * @param ctx Stream context
  * @param buf_ref Buffer reference for zero-copy
- * @return 0 on success
+ * @return 0 on success (packet processed and forwarded)
  */
 int fcc_handle_unicast_media(stream_context_t *ctx, buffer_ref_t *buf_ref);
 
 /**
  * Handle multicast data during transition period
+ * Buffers packets until sync point is reached
  *
  * @param ctx Stream context
  * @param buf_ref Buffer reference for zero-copy
- * @return 0 on success
+ * @return 0 on success (packet buffered or forwarded)
  */
 int fcc_handle_mcast_transition(stream_context_t *ctx, buffer_ref_t *buf_ref);
 
 /**
  * Handle multicast data in active state
+ * Forwards packets directly to client
  *
  * @param ctx Stream context
  * @param buf_ref Buffer reference for zero-copy
- * @return 0 on success
+ * @return 0 on success (packet forwarded)
  */
 int fcc_handle_mcast_active(stream_context_t *ctx, buffer_ref_t *buf_ref);
 

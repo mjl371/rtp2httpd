@@ -70,6 +70,78 @@ int64_t get_realtime_ms(void);
  */
 int set_socket_rcvbuf(int fd, int size);
 
+/**
+ * Bind socket to upstream interface if configured
+ *
+ * @param sock Socket file descriptor to bind
+ * @param ifname Interface name for binding (may be NULL)
+ */
+void bind_to_upstream_interface(int sock, const char *ifname);
+
+/**
+ * Select the appropriate upstream interface for FCC with priority logic
+ * Priority: override_fcc > override > upstream_interface_fcc >
+ * upstream_interface
+ *
+ * @param override Per-service ifname override (from r2h-ifname), or NULL
+ * @param override_fcc Per-service ifname_fcc override (from r2h-ifname-fcc),
+ * or NULL
+ * @return Pointer to the interface name to use (may be NULL if none configured)
+ */
+const char *get_upstream_interface_for_fcc(const char *override,
+                                           const char *override_fcc);
+
+/**
+ * Select the appropriate upstream interface for RTSP with priority logic
+ * Priority: override > upstream_interface_rtsp > upstream_interface
+ *
+ * @param override Per-service ifname override (from r2h-ifname), or NULL
+ * @return Pointer to the interface name to use (may be NULL if none configured)
+ */
+const char *get_upstream_interface_for_rtsp(const char *override);
+
+/**
+ * Select the appropriate upstream interface for multicast with priority logic
+ * Priority: override > upstream_interface_multicast > upstream_interface
+ *
+ * @param override Per-service ifname override (from r2h-ifname), or NULL
+ * @return Pointer to the interface name to use (may be NULL if none configured)
+ */
+const char *get_upstream_interface_for_multicast(const char *override);
+
+/**
+ * Select the appropriate upstream interface for HTTP proxy with priority logic
+ * Priority: override > upstream_interface_http > upstream_interface
+ *
+ * @param override Per-service ifname override (from r2h-ifname), or NULL
+ * @return Pointer to the interface name to use (may be NULL if none configured)
+ */
+const char *get_upstream_interface_for_http(const char *override);
+
+/**
+ * Build base URL for proxy based on request headers and config
+ * Priority: XFF headers (if enabled) > Host header > get_server_address()
+ *
+ * @param host_header HTTP Host header (can be NULL)
+ * @param x_forwarded_host X-Forwarded-Host header (can be NULL)
+ * @param x_forwarded_proto X-Forwarded-Proto header (can be NULL)
+ * @return malloc'd base URL string (caller must free), or NULL on error
+ */
+char *build_proxy_base_url(const char *host_header, const char *x_forwarded_host,
+                           const char *x_forwarded_proto);
+
+/**
+ * Get local IP address for FCC packets
+ * Uses the configured upstream interface for FCC, or falls back to first
+ * non-loopback address
+ *
+ * @param override Per-service ifname override (from r2h-ifname), or NULL
+ * @param override_fcc Per-service ifname_fcc override (from r2h-ifname-fcc),
+ * or NULL
+ * @return Local IP address in host byte order, or 0 if unable to determine
+ */
+uint32_t get_local_ip_for_fcc(const char *override, const char *override_fcc);
+
 /* Array size calculation macro */
 #define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
 

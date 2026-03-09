@@ -1,7 +1,14 @@
 #include "multicast.h"
+#include "buffer_pool.h"
 #include "connection.h"
+#include "fcc.h"
+#include "platform_compat.h"
+#include "poller.h"
+#include "rtp_fec.h"
 #include "service.h"
+#include "stream.h"
 #include "utils.h"
+#include "worker.h"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <ifaddrs.h>
@@ -70,9 +77,10 @@ static uint16_t calculate_checksum(const void *data, size_t len) {
   return ~sum;
 }
 
-static int create_igmp_raw_socket(void) {
+static int create_igmp_raw_socket(service_t *service) {
   int raw_sock;
-  const char *upstream_if = get_upstream_interface_for_multicast();
+  const char *upstream_if =
+      get_upstream_interface_for_multicast(service ? service->ifname : NULL);
 
   raw_sock = socket(AF_INET, SOCK_RAW, IPPROTO_IGMP);
   if (raw_sock < 0) {
@@ -109,148 +117,13 @@ static int create_igmp_raw_socket(void) {
     struct ip_mreqn mreq;
     memset(&mreq, 0, sizeof(mreq));
     mreq.imr_ifindex = if_nametoindex(upstream_if);
-    if (setsockopt(raw_sock, IPPROTO_IP, IP_MULTICAST_IF, &mreq, sizeof(mreq)) <
-        0) {
+    if (setsockopt(raw_sock, IPPROTO_IP, IP_MULTICAST_IF, &mreq,
+                   sizeof(mreq)) < 0) {
       logger(LOG_WARN, "Failed to set IP_MULTICAST_IF: %s", strerror(errno));
     }
   }
 
   return raw_sock;
-}
-
-void bind_to_upstream_interface(int sock, const char *ifname) {
-  if (ifname && ifname[0] != '\0') {
-    struct ifreq ifr;
-    memset(&ifr, 0, sizeof(struct ifreq));
-    strncpy(ifr.ifr_name, ifname, IFNAMSIZ - 1);
-
-    /* Get the latest interface index dynamically to handle interface restarts
-     * (e.g., PPPoE reconnection) */
-    unsigned int ifindex = if_nametoindex(ifr.ifr_name);
-    if (ifindex > 0) {
-      ifr.ifr_ifindex = ifindex;
-    } else {
-      logger(LOG_WARN, "Failed to get interface index for %s: %s", ifr.ifr_name,
-             strerror(errno));
-    }
-
-    if (setsockopt(sock, SOL_SOCKET, SO_BINDTODEVICE, &ifr,
-                   sizeof(struct ifreq)) < 0) {
-      logger(LOG_ERROR, "Failed to bind to upstream interface %s: %s",
-             ifr.ifr_name, strerror(errno));
-    }
-  }
-}
-
-const char *get_upstream_interface_for_fcc(void) {
-  /* Priority: upstream_interface_fcc > upstream_interface */
-  if (config.upstream_interface_fcc[0] != '\0') {
-    return config.upstream_interface_fcc;
-  }
-  if (config.upstream_interface[0] != '\0') {
-    return config.upstream_interface;
-  }
-  return NULL;
-}
-
-const char *get_upstream_interface_for_rtsp(void) {
-  /* Priority: upstream_interface_rtsp > upstream_interface */
-  if (config.upstream_interface_rtsp[0] != '\0') {
-    return config.upstream_interface_rtsp;
-  }
-  if (config.upstream_interface[0] != '\0') {
-    return config.upstream_interface;
-  }
-  return NULL;
-}
-
-const char *get_upstream_interface_for_multicast(void) {
-  /* Priority: upstream_interface_multicast > upstream_interface */
-  if (config.upstream_interface_multicast[0] != '\0') {
-    return config.upstream_interface_multicast;
-  }
-  if (config.upstream_interface[0] != '\0') {
-    return config.upstream_interface;
-  }
-  return NULL;
-}
-
-const char *get_upstream_interface_for_http(void) {
-  /* Priority: upstream_interface_http > upstream_interface */
-  if (config.upstream_interface_http[0] != '\0') {
-    return config.upstream_interface_http;
-  }
-  if (config.upstream_interface[0] != '\0') {
-    return config.upstream_interface;
-  }
-  return NULL;
-}
-
-/**
- * Get local IP address for FCC packets
- * Priority: upstream_interface_fcc > upstream_interface > first non-loopback IP
- */
-uint32_t get_local_ip_for_fcc(void) {
-  const char *ifname = get_upstream_interface_for_fcc();
-  struct ifaddrs *ifaddr, *ifa;
-  uint32_t local_ip = 0;
-
-  if (getifaddrs(&ifaddr) == -1) {
-    logger(LOG_ERROR, "getifaddrs failed: %s", strerror(errno));
-    return 0;
-  }
-
-  /* If specific interface is configured, get its IP */
-  if (ifname && ifname[0] != '\0') {
-    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
-      if (ifa->ifa_addr == NULL)
-        continue;
-
-      if (ifa->ifa_addr->sa_family == AF_INET &&
-          strcmp(ifa->ifa_name, ifname) == 0) {
-        struct sockaddr_in *addr =
-            (struct sockaddr_in *)(uintptr_t)ifa->ifa_addr;
-        local_ip = ntohl(addr->sin_addr.s_addr);
-        logger(LOG_DEBUG, "FCC: Using local IP from interface %s: %u.%u.%u.%u",
-               ifname, (local_ip >> 24) & 0xFF, (local_ip >> 16) & 0xFF,
-               (local_ip >> 8) & 0xFF, local_ip & 0xFF);
-        break;
-      }
-    }
-  }
-
-  /* Fallback: Get first non-loopback IPv4 address */
-  if (local_ip == 0) {
-    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
-      if (ifa->ifa_addr == NULL)
-        continue;
-
-      if (ifa->ifa_addr->sa_family == AF_INET) {
-        struct sockaddr_in *addr =
-            (struct sockaddr_in *)(uintptr_t)ifa->ifa_addr;
-        uint32_t ip = ntohl(addr->sin_addr.s_addr);
-
-        /* Skip loopback (127.0.0.0/8) */
-        if ((ip >> 24) != 127) {
-          local_ip = ip;
-          logger(
-              LOG_DEBUG,
-              "FCC: Using first non-loopback IP from interface %s: %u.%u.%u.%u",
-              ifa->ifa_name, (local_ip >> 24) & 0xFF, (local_ip >> 16) & 0xFF,
-              (local_ip >> 8) & 0xFF, local_ip & 0xFF);
-          break;
-        }
-      }
-    }
-  }
-
-  freeifaddrs(ifaddr);
-
-  if (local_ip == 0) {
-    logger(LOG_WARN, "FCC: Could not determine local IP address");
-  }
-
-  return local_ip;
 }
 
 /*
@@ -281,13 +154,44 @@ static int prepare_mcast_group_req(service_t *service, struct group_req *gr,
     return -1;
   }
 
-  upstream_if = get_upstream_interface_for_multicast();
+  upstream_if =
+      get_upstream_interface_for_multicast(service ? service->ifname : NULL);
   if (upstream_if && upstream_if[0] != '\0') {
     gr->gr_interface = if_nametoindex(upstream_if);
   }
 
+#if defined(__APPLE__) || defined(__FreeBSD__)
+  /* macOS/FreeBSD may require a valid interface index for multicast join
+   * (unlike Linux where 0 means "any"). Fall back to the first non-loopback
+   * interface. */
+  if (gr->gr_interface == 0 && service->addr->ai_family == AF_INET) {
+    struct ifaddrs *ifaddr, *ifa;
+    if (getifaddrs(&ifaddr) == 0) {
+      for (ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr || ifa->ifa_addr->sa_family != AF_INET)
+          continue;
+        if (ifa->ifa_flags & IFF_LOOPBACK)
+          continue;
+        if (!(ifa->ifa_flags & IFF_MULTICAST))
+          continue;
+        if (!(ifa->ifa_flags & IFF_UP))
+          continue;
+        unsigned int idx = if_nametoindex(ifa->ifa_name);
+        if (idx > 0) {
+          gr->gr_interface = idx;
+          logger(LOG_DEBUG,
+                 "Multicast: Auto-selected interface %s (index %u) for join",
+                 ifa->ifa_name, idx);
+          break;
+        }
+      }
+      freeifaddrs(ifaddr);
+    }
+  }
+#endif
+
   /* Prepare source-specific multicast structure if needed */
-  if (strcmp(service->msrc, "") != 0 && service->msrc != NULL) {
+  if (service->msrc != NULL && strcmp(service->msrc, "") != 0) {
     gsr->gsr_group = gr->gr_group;
     gsr->gsr_interface = gr->gr_interface;
     memcpy(&(gsr->gsr_source), service->msrc_addr->ai_addr,
@@ -309,13 +213,18 @@ static int mcast_group_op(int sock, service_t *service, int is_join,
   int op;
   int is_ssm; /* Source-Specific Multicast */
 
+  /* Zero-initialize to avoid garbage in sockaddr_storage padding
+   * (required on macOS where kernel may inspect full struct) */
+  memset(&gr, 0, sizeof(gr));
+  memset(&gsr, 0, sizeof(gsr));
+
   level = prepare_mcast_group_req(service, &gr, &gsr);
   if (level < 0) {
     return -1;
   }
 
   /* Determine if this is source-specific multicast */
-  is_ssm = (strcmp(service->msrc, "") != 0 && service->msrc != NULL);
+  is_ssm = (service->msrc != NULL && strcmp(service->msrc, "") != 0);
 
   /* Select the appropriate operation */
   if (is_ssm) {
@@ -334,7 +243,7 @@ static int mcast_group_op(int sock, service_t *service, int is_join,
   return 0;
 }
 
-int join_mcast_group(service_t *service, int is_fec) {
+static int join_mcast_group(service_t *service, int is_fec) {
   int sock, r;
   int on = 1;
   const char *upstream_if;
@@ -370,11 +279,23 @@ int join_mcast_group(service_t *service, int is_fec) {
            strerror(errno));
   }
 
+#ifdef SO_REUSEPORT
+  /* SO_REUSEPORT allows multiple sockets to bind to the same multicast
+   * address:port. Required on macOS/BSD for reliable multicast receive. */
+  r = setsockopt(sock, SOL_SOCKET, SO_REUSEPORT, &on, sizeof(on));
+  if (r) {
+    logger(LOG_DEBUG, "%s: SO_REUSEPORT failed: %s", log_prefix,
+           strerror(errno));
+  }
+#endif
+
   /* Determine which interface to use */
-  upstream_if = get_upstream_interface_for_multicast();
+  upstream_if =
+      get_upstream_interface_for_multicast(service ? service->ifname : NULL);
   bind_to_upstream_interface(sock, upstream_if);
 
   /* Prepare bind address with appropriate port */
+  memset(&bind_addr, 0, sizeof(bind_addr));
   memcpy(&bind_addr, service->addr->ai_addr, service->addr->ai_addrlen);
   bind_addr_len = service->addr->ai_addrlen;
 
@@ -409,7 +330,7 @@ int join_mcast_group(service_t *service, int is_fec) {
   return sock;
 }
 
-int rejoin_mcast_group(service_t *service) {
+static int rejoin_mcast_group(service_t *service) {
   int raw_sock;
   struct sockaddr_in *mcast_addr;
   struct sockaddr_in *source_addr = NULL;
@@ -446,7 +367,7 @@ int rejoin_mcast_group(service_t *service) {
     nsrcs = 1;
   }
 
-  raw_sock = create_igmp_raw_socket();
+  raw_sock = create_igmp_raw_socket(service);
   if (raw_sock < 0) {
     return -1;
   }
@@ -459,7 +380,9 @@ int rejoin_mcast_group(service_t *service) {
 
     memset(&dest, 0, sizeof(dest));
     dest.sin_family = AF_INET;
-    dest.sin_addr.s_addr = inet_addr("224.0.0.2");
+    /* RFC 2236 §3.7: Membership Reports go to the group address, not 224.0.0.2
+     * (224.0.0.2 is for Leave Group messages only). */
+    dest.sin_addr.s_addr = group_addr;
 
     if (sendto(raw_sock, &report_v2, sizeof(report_v2), 0,
                (struct sockaddr *)&dest, sizeof(dest)) < 0) {
@@ -535,4 +458,183 @@ int rejoin_mcast_group(service_t *service) {
   }
 
   return result;
+}
+
+/*
+ * Multicast session management functions
+ */
+
+void mcast_session_init(mcast_session_t *session) {
+  memset(session, 0, sizeof(mcast_session_t));
+  session->initialized = 1;
+  session->sock = -1;
+}
+
+void mcast_session_cleanup(mcast_session_t *session, int epoll_fd) {
+  if (!session || !session->initialized) {
+    return;
+  }
+
+  if (session->sock >= 0) {
+    worker_cleanup_socket_from_epoll(epoll_fd, session->sock);
+    session->sock = -1;
+    logger(LOG_DEBUG, "Multicast: Socket closed");
+  }
+
+  session->initialized = 0;
+}
+
+int mcast_session_join(mcast_session_t *session, stream_context_t *ctx) {
+  if (!session || !session->initialized) {
+    return -1;
+  }
+
+  if (session->sock >= 0) {
+    return 0; /* Already joined */
+  }
+
+  /* Join main RTP multicast group */
+  int sock = join_mcast_group(ctx->service, 0);
+  if (sock < 0) {
+    return -1;
+  }
+
+  /* Register socket with poller */
+  if (poller_add(ctx->epoll_fd, sock, POLLER_IN) < 0) {
+    logger(LOG_ERROR, "Multicast: Failed to add socket to poller: %s",
+           strerror(errno));
+    close(sock);
+    return -1;
+  }
+  fdmap_set(sock, ctx->conn);
+  logger(LOG_DEBUG, "Multicast: Socket registered with poller");
+
+  /* Reset timeout and rejoin timers */
+  int64_t now = get_time_ms();
+  session->last_data_time = now;
+  session->last_rejoin_time = now;
+  session->sock = sock;
+
+  /* Join FEC multicast group if configured */
+  if (ctx->fec.initialized && fec_is_enabled(&ctx->fec)) {
+    int fec_sock = join_mcast_group(ctx->service, 1);
+    if (fec_sock >= 0) {
+      if (poller_add(ctx->epoll_fd, fec_sock, POLLER_IN) < 0) {
+        logger(LOG_ERROR, "FEC: Failed to add socket to poller: %s",
+               strerror(errno));
+        close(fec_sock);
+      } else {
+        ctx->fec.sock = fec_sock;
+        fdmap_set(fec_sock, ctx->conn);
+      }
+    }
+  }
+
+  return 0;
+}
+
+int mcast_session_handle_event(mcast_session_t *session, stream_context_t *ctx,
+                               int64_t now) {
+  if (!session || !session->initialized || session->sock < 0) {
+    return -1;
+  }
+
+  /* Drain all available packets from the socket.  This is required for
+   * edge-triggered pollers (epoll EPOLLET / kqueue EV_CLEAR) where the read event fires
+   * only once per data arrival transition and won't re-trigger while
+   * unread data remains in the socket buffer. */
+  for (;;) {
+    /* Allocate buffer from pool */
+    buffer_ref_t *recv_buf = buffer_pool_alloc();
+    if (!recv_buf) {
+      logger(LOG_DEBUG, "Multicast: Buffer pool exhausted, dropping packet");
+      session->last_data_time = now;
+      /* Drain socket to prevent event loop spinning */
+      uint8_t dummy[BUFFER_POOL_BUFFER_SIZE];
+      recv(session->sock, dummy, sizeof(dummy), 0);
+      return 0;
+    }
+
+    /* Receive into buffer */
+    int actualr =
+        recv(session->sock, recv_buf->data, BUFFER_POOL_BUFFER_SIZE, 0);
+    if (actualr < 0) {
+      buffer_ref_put(recv_buf);
+      if (errno != EAGAIN)
+        logger(LOG_DEBUG, "Multicast: Receive failed: %s", strerror(errno));
+      break; /* No more data available */
+    }
+
+    session->last_data_time = now;
+    recv_buf->data_size = (size_t)actualr;
+
+    int result = 0;
+
+    /* Handle based on FCC state (if FCC initialized) */
+    if (!ctx->fcc.initialized) {
+      /* Direct multicast without FCC - forward to client */
+      int processed_bytes = stream_process_rtp_payload(ctx, recv_buf);
+      if (processed_bytes > 0) {
+        ctx->total_bytes_sent += (uint64_t)processed_bytes;
+      }
+      buffer_ref_put(recv_buf);
+      continue; /* Read next packet */
+    }
+
+    switch (ctx->fcc.state) {
+    case FCC_STATE_MCAST_ACTIVE:
+      result = fcc_handle_mcast_active(ctx, recv_buf);
+      break;
+
+    case FCC_STATE_MCAST_REQUESTED:
+      result = fcc_handle_mcast_transition(ctx, recv_buf);
+      break;
+
+    default:
+      logger(LOG_DEBUG, "Received multicast data in unexpected FCC state: %d",
+             ctx->fcc.state);
+      break;
+    }
+
+    buffer_ref_put(recv_buf);
+
+    if (result != 0)
+      return result;
+  }
+
+  return 0;
+}
+
+int mcast_session_tick(mcast_session_t *session, service_t *service,
+                       int64_t now) {
+  if (!session || !session->initialized || session->sock < 0) {
+    return 0;
+  }
+
+  /* Periodic multicast rejoin (if enabled) */
+  if (config.mcast_rejoin_interval > 0) {
+    int64_t elapsed_ms = now - session->last_rejoin_time;
+    if (elapsed_ms >= config.mcast_rejoin_interval * 1000) {
+      logger(LOG_DEBUG, "Multicast: Periodic rejoin (interval: %d seconds)",
+             config.mcast_rejoin_interval);
+
+      if (rejoin_mcast_group(service) == 0) {
+        session->last_rejoin_time = now;
+      } else {
+        logger(LOG_ERROR,
+               "Multicast: Failed to rejoin group, will retry next interval");
+      }
+    }
+  }
+
+  /* Check for multicast stream timeout */
+  int64_t elapsed_ms = now - session->last_data_time;
+  if (elapsed_ms >= MCAST_TIMEOUT_SEC * 1000) {
+    logger(LOG_ERROR,
+           "Multicast: No data received for %d seconds, closing connection",
+           MCAST_TIMEOUT_SEC);
+    return -1;
+  }
+
+  return 0;
 }

@@ -15,7 +15,8 @@ typedef enum {
   STATUS_503 = 4,
   STATUS_500 = 5,
   STATUS_401 = 6,
-  STATUS_304 = 7
+  STATUS_304 = 7,
+  STATUS_204 = 8
 } http_status_t;
 
 /* Content Types */
@@ -50,6 +51,8 @@ typedef struct {
   char x_forwarded_proto[16];
   int x_request_snapshot;
   char cookie[1024];  /* Cookie header value for r2h-token extraction */
+  char access_control_request_method[64];   /* CORS preflight method */
+  char access_control_request_headers[512]; /* CORS preflight headers */
   http_parse_state_t parse_state;
   int content_length;
   char *body;         /* Dynamically allocated based on Content-Length */
@@ -139,6 +142,48 @@ int http_parse_query_param(const char *query_string, const char *param_name,
  */
 int http_filter_query_param(const char *query_string, const char *exclude_param,
                             char *output, size_t output_size);
+
+/**
+ * Find $label suffix at the end of a URL.
+ * A $label is a trailing "$..." at the very end of the URL, used for UI display
+ * in frontend players. The '$' must NOT be followed by '{' (to avoid matching
+ * ${placeholder} patterns used in dynamic parameters).
+ *
+ * @param url Input URL string
+ * @return Pointer to the '$' within the url string, or NULL if no label found
+ */
+const char *http_find_url_label(const char *url);
+
+/**
+ * Strip $label suffix from the end of a URL in-place.
+ * Uses http_find_url_label() to locate the label, then truncates the string.
+ *
+ * @param url URL string to modify in-place
+ */
+void http_strip_url_label(char *url);
+
+/**
+ * Filter Cookie header to remove a specific cookie (case-insensitive name)
+ * Cookie format: "name1=value1; name2=value2; ..."
+ * @param cookie_header Input cookie header value
+ * @param exclude_name Cookie name to exclude (case-insensitive)
+ * @param output Output buffer
+ * @param output_size Output buffer size
+ * @return Length of output string, or -1 on error
+ */
+int http_filter_cookie(const char *cookie_header, const char *exclude_name,
+                       char *output, size_t output_size);
+
+/**
+ * Filter User-Agent header to remove R2HTOKEN/xxx pattern
+ * Format: "... R2HTOKEN/value ..." or "... R2HTOKEN/value"
+ * @param user_agent Input User-Agent header value
+ * @param output Output buffer
+ * @param output_size Output buffer size
+ * @return Length of output string, or -1 on error
+ */
+int http_filter_user_agent_token(const char *user_agent, char *output,
+                                 size_t output_size);
 
 /**
  * Send HTTP 400 Bad Request response

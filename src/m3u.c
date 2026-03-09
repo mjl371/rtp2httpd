@@ -3,6 +3,7 @@
 #include "epg.h"
 #include "http.h"
 #include "http_fetch.h"
+#include "http_proxy.h"
 #include "md5.h"
 #include "service.h"
 #include "utils.h"
@@ -476,6 +477,10 @@ static char *extract_dynamic_params(const char *url) {
       if (has_placeholder) {
         /* Add this parameter to result */
         size_t param_len = param_end - param_start;
+        if (result_len + param_len + 2 > sizeof(result)) {
+          logger(LOG_WARN, "Dynamic params exceed buffer size, truncating");
+          break;
+        }
         if (!first_param) {
           result[result_len++] = '&';
         }
@@ -559,7 +564,7 @@ static int extract_wrapped_url(const char *url, char *extracted,
 
   /* Check if protocol is supported */
   if (strcasecmp(protocol, "rtp") != 0 && strcasecmp(protocol, "udp") != 0 &&
-      strcasecmp(protocol, "rtsp") != 0) {
+      strcasecmp(protocol, "rtsp") != 0 && strcasecmp(protocol, "http") != 0) {
     return -1; /* Unsupported protocol */
   }
 
@@ -604,20 +609,16 @@ static int build_service_url(const char *service_name, const char *query_params,
 
   /* Build URL with placeholder and appropriate query parameters */
   if (has_query_params && has_r2h_token) {
-    /* Include both query parameters and r2h-token */
     result = snprintf(output, output_size, "%s%s?%s&r2h-token=%s",
                       M3U_BASE_URL_PLACEHOLDER, encoded_name, query_params,
                       encoded_token);
   } else if (has_query_params) {
-    /* Include only query parameters */
     result = snprintf(output, output_size, "%s%s?%s", M3U_BASE_URL_PLACEHOLDER,
                       encoded_name, query_params);
   } else if (has_r2h_token) {
-    /* Include only r2h-token */
     result = snprintf(output, output_size, "%s%s?r2h-token=%s",
                       M3U_BASE_URL_PLACEHOLDER, encoded_name, encoded_token);
   } else {
-    /* No query parameters */
     result = snprintf(output, output_size, "%s%s", M3U_BASE_URL_PLACEHOLDER,
                       encoded_name);
   }
@@ -634,89 +635,6 @@ static int build_service_url(const char *service_name, const char *query_params,
   return 0;
 }
 
-/* Check if URL is a plain HTTP URL that should be proxied
- * Returns: 1 if URL is http:// (not https://), 0 otherwise
- */
-static int is_http_proxy_url(const char *url) {
-  /* Only support http:// URLs for proxying (not https://) */
-  if (strncasecmp(url, "http://", 7) == 0) {
-    /* Make sure it's not already a wrapped URL (http://host/rtp/...) */
-    const char *path_start = strchr(url + 7, '/');
-    if (path_start) {
-      /* Check if path starts with /rtp/, /udp/, /rtsp/, or /http/ */
-      if (strncmp(path_start, "/rtp/", 5) == 0 ||
-          strncmp(path_start, "/udp/", 5) == 0 ||
-          strncmp(path_start, "/rtsp/", 6) == 0 ||
-          strncmp(path_start, "/http/", 6) == 0) {
-        return 0; /* Already wrapped, don't treat as plain HTTP */
-      }
-    }
-    return 1;
-  }
-  return 0;
-}
-
-/* Build HTTP proxy URL for transformed M3U
- * Converts http://host:port/path to {BASE_URL}http/host:port/path
- * http_url: original HTTP URL (must start with http://)
- * output: buffer to store transformed URL
- * output_size: size of output buffer
- * Returns: 0 on success, -1 on error
- */
-static int build_http_proxy_url(const char *http_url, char *output,
-                                size_t output_size) {
-  const char *host_start;
-  char *encoded_token = NULL;
-  int result;
-  int has_r2h_token = (config.r2h_token && config.r2h_token[0] != '\0');
-
-  /* Skip http:// prefix */
-  if (strncasecmp(http_url, "http://", 7) != 0) {
-    logger(LOG_ERROR, "build_http_proxy_url: URL must start with http://");
-    return -1;
-  }
-  host_start = http_url + 7; /* Points to host:port/path */
-
-  /* URL encode r2h-token if configured */
-  if (has_r2h_token) {
-    encoded_token = http_url_encode(config.r2h_token);
-    if (!encoded_token) {
-      logger(LOG_ERROR, "Failed to URL encode r2h-token");
-      return -1;
-    }
-  }
-
-  /* Build proxy URL: {BASE_URL}http/host:port/path[?r2h-token=xxx] */
-  /* Check if original URL has query parameters */
-  const char *query_start = strchr(host_start, '?');
-
-  if (has_r2h_token && encoded_token) {
-    if (query_start) {
-      /* Original URL has query params, append r2h-token with & */
-      result = snprintf(output, output_size, "%shttp/%s&r2h-token=%s",
-                        M3U_BASE_URL_PLACEHOLDER, host_start, encoded_token);
-    } else {
-      /* No query params, add r2h-token with ? */
-      result = snprintf(output, output_size, "%shttp/%s?r2h-token=%s",
-                        M3U_BASE_URL_PLACEHOLDER, host_start, encoded_token);
-    }
-  } else {
-    /* No r2h-token, just transform the URL */
-    result = snprintf(output, output_size, "%shttp/%s", M3U_BASE_URL_PLACEHOLDER,
-                      host_start);
-  }
-
-  if (encoded_token)
-    free(encoded_token);
-
-  if (result >= (int)output_size) {
-    logger(LOG_ERROR, "HTTP proxy URL too long");
-    return -1;
-  }
-
-  return 0;
-}
-
 /* Check if URL can be recognized and converted to a service
  * Returns: 1 if URL can be handled, 0 otherwise
  */
@@ -727,20 +645,18 @@ static int is_url_recognizable(const char *url) {
   strncpy(test_url, url, sizeof(test_url) - 1);
   test_url[sizeof(test_url) - 1] = '\0';
 
-  /* Try to extract wrapped URL */
+  /* Try to extract wrapped URL (supports rtp, udp, rtsp, http) */
   if (extract_wrapped_url(test_url, extracted, sizeof(extracted)) == 0) {
-    /* Use extracted URL for checking */
-    size_t len = strlen(extracted);
-    if (len >= sizeof(test_url))
-      len = sizeof(test_url) - 1;
-    memcpy(test_url, extracted, len);
-    test_url[len] = '\0';
+    /* Wrapped URL extracted - always recognizable since extract_wrapped_url
+     * only succeeds for supported protocols */
+    return 1;
   }
 
-  /* Check if protocol is supported */
+  /* Not a wrapped URL - check direct protocols */
   if (strncmp(test_url, "rtp://", 6) == 0 ||
       strncmp(test_url, "udp://", 6) == 0 ||
-      strncmp(test_url, "rtsp://", 7) == 0) {
+      strncmp(test_url, "rtsp://", 7) == 0 ||
+      strncmp(test_url, "http://", 7) == 0) {
     return 1;
   }
 
@@ -832,10 +748,11 @@ static char *find_unique_service_name(const char *service_name) {
   service_t *existing;
   int max_suffix = 0;
   char test_name[MAX_SERVICE_NAME];
-  char *result = NULL;
   int base_exists = 0;
 
-  /* Check if base name exists and find max numbered suffix */
+  /* Check if base name exists and find max numbered suffix.
+   * Service names use /label for $label differentiation (e.g.,
+   * "group/channel/UHD"), so dedup is a simple string comparison. */
   for (existing = services; existing != NULL; existing = existing->next) {
     if (!existing->url)
       continue;
@@ -871,13 +788,10 @@ static char *find_unique_service_name(const char *service_name) {
   }
 
   /* Base name is taken, assign next available number */
-  /* Start from 2 (first duplicate), or max_suffix + 1 if numbered services
-   * already exist */
   int next_suffix = (max_suffix > 0) ? max_suffix + 1 : 2;
   snprintf(test_name, sizeof(test_name), "%s/%d", service_name, next_suffix);
-  result = strdup(test_name);
 
-  return result;
+  return strdup(test_name);
 }
 
 /* Create a service from name and URL
@@ -904,6 +818,11 @@ static char *create_service_from_url(const char *service_name, const char *url,
     normalized_url[sizeof(normalized_url) - 1] = '\0';
   }
 
+  /* Strip $label suffix from URL before creating service
+   * ($label is a UI display tag at the end of URL, not part of the actual
+   * address) */
+  http_strip_url_label(normalized_url);
+
   /* Find unique service name (handles duplicates automatically) */
   unique_name = find_unique_service_name(service_name);
   if (!unique_name) {
@@ -921,6 +840,8 @@ static char *create_service_from_url(const char *service_name, const char *url,
     new_service = service_create_from_rtp_url(normalized_url);
   } else if (strncmp(normalized_url, "rtsp://", 7) == 0) {
     new_service = service_create_from_rtsp_url(normalized_url);
+  } else if (strncmp(normalized_url, "http://", 7) == 0) {
+    new_service = service_create_from_http_url(normalized_url);
   } else {
     logger(LOG_WARN, "Unsupported URL format in M3U: %s", normalized_url);
     free(unique_name);
@@ -961,8 +882,22 @@ static char *create_service_from_url(const char *service_name, const char *url,
   /* Add to service hashmap for O(1) lookup */
   service_hashmap_add(new_service);
 
-  logger(LOG_DEBUG, "Service created: %s (%s) [%s]", unique_name,
-         new_service->service_type == SERVICE_MRTP ? "RTP" : "RTSP",
+  const char *type_str;
+  switch (new_service->service_type) {
+  case SERVICE_MRTP:
+    type_str = "RTP";
+    break;
+  case SERVICE_RTSP:
+    type_str = "RTSP";
+    break;
+  case SERVICE_HTTP:
+    type_str = "HTTP";
+    break;
+  default:
+    type_str = "UNKNOWN";
+    break;
+  }
+  logger(LOG_DEBUG, "Service created: %s (%s) [%s]", unique_name, type_str,
          source == SERVICE_SOURCE_INLINE ? "inline" : "external");
 
   /* Return the unique name for use in transformed M3U */
@@ -978,7 +913,13 @@ int m3u_parse_and_create_services(const char *content, const char *source_url) {
   size_t line_len;
   char proxy_url[MAX_URL_LENGTH];
   char transformed_line[MAX_M3U_LINE];
-
+  
+  /* Check and skip UTF-8 BOM */
+  if (strncmp(content_ptr, "\xEF\xBB\xBF", 3) == 0) {
+    content_ptr += 3;
+    logger(LOG_DEBUG, "Detected and skipped UTF-8 BOM in M3U content");
+  }
+  
   memset(&current_extinf, 0, sizeof(current_extinf));
 
   logger(LOG_INFO, "Parsing M3U content from: %s",
@@ -1117,13 +1058,36 @@ int m3u_parse_and_create_services(const char *content, const char *source_url) {
 
     /* Process URL line (follows EXTINF) */
     if (in_entry && line[0] != '#') {
+      /* Extract $label suffix from URL end before any processing */
+      const char *url_label = http_find_url_label(line);
+      char url_label_copy[MAX_SERVICE_NAME];
+      if (url_label) {
+        strncpy(url_label_copy, url_label, sizeof(url_label_copy) - 1);
+        url_label_copy[sizeof(url_label_copy) - 1] = '\0';
+      } else {
+        url_label_copy[0] = '\0';
+      }
+
       /* Check if URL is recognizable */
       int is_recognizable = is_url_recognizable(line);
 
       if (is_recognizable) {
+        /* Build service name: append /label (converting $label to /label)
+         * so that same channel with different labels get distinct paths */
+        char name_with_label[MAX_SERVICE_NAME];
+        if (url_label_copy[0] == '$' && url_label_copy[1] != '\0') {
+          /* Convert "$label" to "/label" and append to service name */
+          snprintf(name_with_label, sizeof(name_with_label), "%s/%s",
+                   current_extinf.name, url_label_copy + 1);
+        } else {
+          strncpy(name_with_label, current_extinf.name,
+                  sizeof(name_with_label) - 1);
+          name_with_label[sizeof(name_with_label) - 1] = '\0';
+        }
+
         /* Recognizable URL: create service first to get unique name */
         char *unique_service_name =
-            create_service_from_url(current_extinf.name, line, service_source);
+            create_service_from_url(name_with_label, line, service_source);
 
         if (unique_service_name) {
           char *unique_catchup_name = NULL;
@@ -1140,6 +1104,33 @@ int m3u_parse_and_create_services(const char *content, const char *source_url) {
                        unique_service_name);
               unique_catchup_name = create_service_from_url(
                   catchup_name, current_extinf.catchup_source, service_source);
+            }
+          }
+
+          /* Extract dynamic params from URL without $label to avoid
+           * $label causing static params (like fcc) to be treated as dynamic */
+          char line_without_label[MAX_M3U_LINE];
+          strncpy(line_without_label, line, sizeof(line_without_label) - 1);
+          line_without_label[sizeof(line_without_label) - 1] = '\0';
+          http_strip_url_label(line_without_label);
+          char *main_query = extract_dynamic_params(line_without_label);
+          int main_url_has_query = 0;
+
+          /* Build service URL using the actual unique service name for
+           * transformed M3U */
+          if (build_service_url(unique_service_name, main_query, proxy_url,
+                                sizeof(proxy_url)) == 0) {
+            /* Check if the generated URL has query parameters */
+            main_url_has_query = (strchr(proxy_url, '?') != NULL);
+
+            /* Append raw $label to the very end of proxy URL (after any query
+             * params) so that it always appears as the last part of the URL */
+            if (url_label_copy[0] != '\0') {
+              size_t purl_len = strlen(proxy_url);
+              size_t lbl_len = strlen(url_label_copy);
+              if (purl_len + lbl_len < sizeof(proxy_url)) {
+                memcpy(proxy_url + purl_len, url_label_copy, lbl_len + 1);
+              }
             }
           }
 
@@ -1186,32 +1177,47 @@ int m3u_parse_and_create_services(const char *content, const char *source_url) {
           } else if (current_extinf.has_catchup &&
                      strlen(current_extinf.catchup_source) > 0 &&
                      !catchup_is_recognizable &&
-                     current_extinf.catchup_source[0] == '&') {
-            /* catchup-source is not recognizable but starts with '&', and main
-             * service was converted Replace '&' with '?' to make it valid for
-             * append mode */
-            char *catchup_start = strstr(transformed_line, "catchup-source=\"");
-            if (catchup_start) {
-              catchup_start += 16; /* Skip 'catchup-source="' */
-              char *catchup_end = strchr(catchup_start, '"');
-              if (catchup_end) {
-                /* Build transformed EXTINF line with modified catchup-source */
-                size_t prefix_len = catchup_start - transformed_line;
-                char final_extinf[MAX_M3U_LINE];
-                /* Replace leading '&' with '?' */
-                snprintf(final_extinf, sizeof(final_extinf), "%.*s?%.*s%s",
-                         (int)prefix_len, transformed_line,
-                         (int)(catchup_end - catchup_start - 1),
-                         catchup_start + 1, catchup_end);
-                append_to_transformed_m3u(final_extinf, service_source);
-                append_to_transformed_m3u("\n", service_source);
+                     (current_extinf.catchup_source[0] == '&' ||
+                      current_extinf.catchup_source[0] == '?')) {
+            /* catchup-source is not recognizable but starts with '&' or '?',
+             * and main service was converted. Adjust the leading character
+             * based on whether main URL has query parameters:
+             * - Main URL has '?': catchup-source should start with '&'
+             * - Main URL has no '?': catchup-source should start with '?' */
+            char expected_char = main_url_has_query ? '&' : '?';
+            char current_char = current_extinf.catchup_source[0];
+
+            if (current_char == expected_char) {
+              /* Already correct, keep as-is */
+              append_to_transformed_m3u(transformed_line, service_source);
+              append_to_transformed_m3u("\n", service_source);
+            } else {
+              /* Need to replace leading character */
+              char *catchup_start =
+                  strstr(transformed_line, "catchup-source=\"");
+              if (catchup_start) {
+                catchup_start += 16; /* Skip 'catchup-source="' */
+                char *catchup_end = strchr(catchup_start, '"');
+                if (catchup_end) {
+                  /* Build transformed EXTINF line with modified catchup-source
+                   */
+                  size_t prefix_len = catchup_start - transformed_line;
+                  char final_extinf[MAX_M3U_LINE];
+                  /* Replace leading char with expected_char */
+                  snprintf(final_extinf, sizeof(final_extinf), "%.*s%c%.*s%s",
+                           (int)prefix_len, transformed_line, expected_char,
+                           (int)(catchup_end - catchup_start - 1),
+                           catchup_start + 1, catchup_end);
+                  append_to_transformed_m3u(final_extinf, service_source);
+                  append_to_transformed_m3u("\n", service_source);
+                } else {
+                  append_to_transformed_m3u(transformed_line, service_source);
+                  append_to_transformed_m3u("\n", service_source);
+                }
               } else {
                 append_to_transformed_m3u(transformed_line, service_source);
                 append_to_transformed_m3u("\n", service_source);
               }
-            } else {
-              append_to_transformed_m3u(transformed_line, service_source);
-              append_to_transformed_m3u("\n", service_source);
             }
           } else {
             /* No catchup or unrecognizable catchup URL, use original EXTINF */
@@ -1219,13 +1225,8 @@ int m3u_parse_and_create_services(const char *content, const char *source_url) {
             append_to_transformed_m3u("\n", service_source);
           }
 
-          /* Now generate the main service URL */
-          char *main_query = extract_dynamic_params(line);
-
-          /* Build service URL using the actual unique service name for
-           * transformed M3U */
-          if (build_service_url(unique_service_name, main_query, proxy_url,
-                                sizeof(proxy_url)) == 0) {
+          /* Append the main service URL */
+          if (proxy_url[0] != '\0') {
             append_to_transformed_m3u(proxy_url, service_source);
           } else {
             append_to_transformed_m3u(line, service_source);
@@ -1244,23 +1245,6 @@ int m3u_parse_and_create_services(const char *content, const char *source_url) {
           append_to_transformed_m3u(line, service_source);
           append_to_transformed_m3u("\n", service_source);
         }
-      } else if (is_http_proxy_url(line)) {
-        /* HTTP URL: convert to http proxy format without creating a service */
-        char http_proxy_url[MAX_URL_LENGTH];
-
-        append_to_transformed_m3u(transformed_line, service_source);
-        append_to_transformed_m3u("\n", service_source);
-
-        if (build_http_proxy_url(line, http_proxy_url, sizeof(http_proxy_url)) ==
-            0) {
-          append_to_transformed_m3u(http_proxy_url, service_source);
-          logger(LOG_DEBUG, "Converted HTTP URL to proxy format: %s", line);
-        } else {
-          /* Failed to build proxy URL, preserve original */
-          append_to_transformed_m3u(line, service_source);
-          logger(LOG_WARN, "Failed to convert HTTP URL: %s", line);
-        }
-        append_to_transformed_m3u("\n", service_source);
       } else {
         /* Unrecognizable URL: preserve original EXTINF and URL completely */
         append_to_transformed_m3u(transformed_line, service_source);
@@ -1326,50 +1310,10 @@ char *m3u_generate_playlist(const char *host_header,
   }
 
   /* Build base URL based on headers and xff config */
-  const char *host = NULL;
-  const char *proto = "http";
-
-  /* Extract protocol from config.hostname if configured */
-  char config_protocol[16] = {0};
-  if (config.hostname && config.hostname[0] != '\0') {
-    /* Parse URL components from config.hostname to extract protocol */
-    if (http_parse_url_components(config.hostname, config_protocol, NULL, NULL,
-                                  NULL) == 0) {
-      /* Successfully parsed - use protocol from config.hostname if present */
-      if (config_protocol[0] != '\0') {
-        proto = config_protocol;
-      }
-    }
-  }
-
-  if (config.xff && x_forwarded_host && x_forwarded_host[0]) {
-    /* Use X-Forwarded-Host when xff is enabled */
-    host = x_forwarded_host;
-    if (x_forwarded_proto && x_forwarded_proto[0]) {
-      /* X-Forwarded-Proto overrides config.hostname protocol */
-      proto = x_forwarded_proto;
-    }
-  } else if (host_header && host_header[0]) {
-    /* Use Host header */
-    host = host_header;
-  }
-
-  if (host) {
-    /* Build base URL from host and proto */
-    size_t url_len = strlen(proto) + 3 + strlen(host) + 2; /* proto://host/ */
-    base_url = malloc(url_len);
-    if (!base_url) {
-      logger(LOG_ERROR, "Failed to allocate base URL");
-      return NULL;
-    }
-    snprintf(base_url, url_len, "%s://%s/", proto, host);
-  } else {
-    /* Fallback to get_server_address */
-    base_url = get_server_address();
-    if (!base_url) {
-      logger(LOG_ERROR, "Failed to get server address for M3U generation");
-      return NULL;
-    }
+  base_url = build_proxy_base_url(host_header, x_forwarded_host, x_forwarded_proto);
+  if (!base_url) {
+    logger(LOG_ERROR, "Failed to build base URL for M3U generation");
+    return NULL;
   }
 
   logger(LOG_DEBUG, "Generating M3U with base URL: %s", base_url);
@@ -1398,7 +1342,7 @@ char *m3u_generate_playlist(const char *host_header,
     int written;
     int has_r2h_token = (config.r2h_token && config.r2h_token[0] != '\0');
     char *encoded_token = NULL;
-    
+
     /* URL encode r2h-token if configured */
     if (has_r2h_token) {
       encoded_token = http_url_encode(config.r2h_token);
@@ -1408,16 +1352,16 @@ char *m3u_generate_playlist(const char *host_header,
         has_r2h_token = 0;
       }
     }
-    
+
     if (has_r2h_token && encoded_token) {
       /* Include r2h-token in EPG URL */
       if (epg->is_gzipped) {
         written = snprintf(dst_ptr, result_size - result_used,
-                           "#EXTM3U x-tvg-url=\"%sepg.xml.gz?r2h-token=%s\"\n\n", 
+                           "#EXTM3U x-tvg-url=\"%sepg.xml.gz?r2h-token=%s\"\n\n",
                            base_url, encoded_token);
       } else {
         written = snprintf(dst_ptr, result_size - result_used,
-                           "#EXTM3U x-tvg-url=\"%sepg.xml?r2h-token=%s\"\n\n", 
+                           "#EXTM3U x-tvg-url=\"%sepg.xml?r2h-token=%s\"\n\n",
                            base_url, encoded_token);
       }
     } else {
@@ -1430,12 +1374,12 @@ char *m3u_generate_playlist(const char *host_header,
                            "#EXTM3U x-tvg-url=\"%sepg.xml\"\n\n", base_url);
       }
     }
-    
+
     if (written > 0) {
       dst_ptr += written;
       result_used += written;
     }
-    
+
     if (encoded_token) {
       free(encoded_token);
     }

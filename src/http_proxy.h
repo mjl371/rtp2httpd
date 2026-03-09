@@ -42,6 +42,7 @@ typedef enum {
 
 /* HTTP proxy session structure */
 typedef struct {
+  int initialized; /* Flag: session has been initialized with resources */
   int socket;                        /* TCP socket to upstream server */
   int epoll_fd;                      /* Epoll file descriptor for socket
                                         registration */
@@ -83,6 +84,24 @@ typedef struct {
   const char *request_body; /* Points to http_request_t.body, no ownership */
   size_t request_body_len;
   size_t request_body_sent; /* Bytes of request body already sent */
+
+  /* Body rewriting state (for M3U, HTML, etc.) */
+  int needs_body_rewrite;          /* Flag: response needs body rewriting */
+  char *rewrite_body_buffer;       /* Dynamically allocated body buffer */
+  size_t rewrite_body_buffer_size; /* Allocated buffer size */
+  size_t rewrite_body_buffer_used; /* Bytes used in buffer */
+
+  /* Saved response headers for passthrough during body rewrite */
+  char *saved_response_headers;    /* malloc'd copy of original response headers */
+  size_t saved_response_headers_len;
+
+  /* Request headers for base URL construction */
+  char host_header[HTTP_PROXY_HOST_SIZE];           /* Host header from client */
+  char x_forwarded_host[HTTP_PROXY_HOST_SIZE];      /* X-Forwarded-Host header */
+  char x_forwarded_proto[16];                       /* X-Forwarded-Proto header */
+
+  /* Per-service upstream interface override (resolved at init, non-owning) */
+  const char *upstream_ifname;
 
   /* Cleanup state */
   int cleanup_done; /* Flag: cleanup has been completed */
@@ -133,6 +152,18 @@ void http_proxy_set_request_body(http_proxy_session_t *session,
                                  const char *body, size_t body_len);
 
 /**
+ * Set request headers for base URL construction during content rewriting
+ * @param session HTTP proxy session
+ * @param host_header Host header value (can be NULL)
+ * @param x_forwarded_host X-Forwarded-Host header value (can be NULL)
+ * @param x_forwarded_proto X-Forwarded-Proto header value (can be NULL)
+ */
+void http_proxy_set_request_headers(http_proxy_session_t *session,
+                                    const char *host_header,
+                                    const char *x_forwarded_host,
+                                    const char *x_forwarded_proto);
+
+/**
  * Connect to upstream HTTP server (non-blocking)
  * @param session HTTP proxy session (must have epoll_fd set)
  * @return 0 on success (connection in progress), -1 on error
@@ -157,5 +188,19 @@ int http_proxy_handle_socket_event(http_proxy_session_t *session,
  * @return 0 if cleanup completed
  */
 int http_proxy_session_cleanup(http_proxy_session_t *session);
+
+/**
+ * Build HTTP proxy URL for transformed M3U
+ * Converts http://host:port/path to {BASE_URL}http/host:port/path
+ *
+ * @param http_url Original HTTP URL (must start with http://)
+ * @param base_url_placeholder Placeholder string for base URL (e.g.,
+ * "{BASE_URL}")
+ * @param output Buffer to store transformed URL
+ * @param output_size Size of output buffer
+ * @return 0 on success, -1 on error
+ */
+int http_proxy_build_url(const char *http_url, const char *base_url_placeholder,
+                         char *output, size_t output_size);
 
 #endif /* __HTTP_PROXY_H__ */

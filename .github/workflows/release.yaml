@@ -56,11 +56,9 @@ jobs:
 
       - name: Install frontend dependencies
         run: pnpm install --frozen-lockfile
-        working-directory: web-ui
 
       - name: Build frontend
-        run: pnpm run build
-        working-directory: web-ui
+        run: pnpm run web-ui:build
 
       - name: Save generated pages
         run: |
@@ -129,7 +127,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64,linux/arm64,linux/arm/v7,linux/riscv64
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -138,7 +136,7 @@ jobs:
           build-args: |
             RELEASE_VERSION=${{ env.RELEASE_VERSION }}
 
-  ipk:
+  openwrt-packages:
     name: Package ${{ matrix.arch }}-${{ matrix.sdk }}
     needs: frontend
     runs-on: ubuntu-latest
@@ -167,11 +165,10 @@ jobs:
           - mipsel_24kc_24kf
           - mipsel_74kc
           - mipsel_mips32
-          - riscv64_riscv64
 
         sdk:
           - "24.10.4" # For IPK
-          - "SNAPSHOT" # For APK
+          - "25.12.0" # For APK
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -226,7 +223,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  static-bin:
+  linux-static-bin:
     name: Static Binary ${{ matrix.arch }}
     needs: frontend
     runs-on: ubuntu-latest
@@ -245,7 +242,6 @@ jobs:
           - mipsel-unknown-linux-musl
           - mips-unknown-linux-musl
           - mips64-unknown-linux-musl
-          - riscv64-unknown-linux-musl
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -256,10 +252,8 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            autoconf \
-            automake \
+            cmake \
             build-essential \
-            pkg-config \
             wget \
             xz-utils
 
@@ -267,9 +261,6 @@ jobs:
         run: |
           RELEASE_TAG="${{ github.event.release.tag_name }}"
           echo "RELEASE_VERSION=${RELEASE_TAG#v}" >> $GITHUB_ENV
-
-      - name: Generate configure script
-        run: autoreconf -fi
 
       - name: Build static binary
         env:
@@ -308,6 +299,168 @@ jobs:
           ls -lh "$OUTPUT_NAME"
 
           echo "binary_name=$OUTPUT_NAME" >> $GITHUB_OUTPUT
+
+      - name: Upload to release assets
+        run: |
+          gh release upload \
+            --repo ${{ github.repository }} \
+            ${{ github.event.release.tag_name }} \
+            ${{ steps.prepare.outputs.binary_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  macos-static-bin:
+    name: macOS Binary ${{ matrix.arch }}
+    needs: frontend
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: macos-26-intel
+          - arch: arm64
+            runner: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Set version environment variable
+        run: |
+          RELEASE_TAG="${{ github.event.release.tag_name }}"
+          echo "RELEASE_VERSION=${RELEASE_TAG#v}" >> $GITHUB_ENV
+
+      - name: Build binary
+        run: |
+          BUILD_DIR="build-macos-${{ matrix.arch }}"
+          mkdir -p "$BUILD_DIR"
+          cd "$BUILD_DIR"
+
+          RELEASE_VERSION="${RELEASE_VERSION}" cmake .. \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_AGGRESSIVE_OPT=ON \
+            -DCMAKE_INSTALL_PREFIX=/usr/local
+
+          cmake --build . -j$(sysctl -n hw.ncpu)
+
+          DESTDIR="$(pwd)/dist" cmake --install . --strip
+
+      - name: Prepare release artifact
+        id: prepare
+        run: |
+          BUILD_DIR="build-macos-${{ matrix.arch }}"
+          BINARY_PATH="${BUILD_DIR}/dist/usr/local/bin/rtp2httpd"
+
+          if [ ! -f "$BINARY_PATH" ]; then
+            echo "Error: Binary not found at $BINARY_PATH"
+            exit 1
+          fi
+
+          OUTPUT_NAME="rtp2httpd-${RELEASE_VERSION}-macos-${{ matrix.arch }}"
+          cp "$BINARY_PATH" "$OUTPUT_NAME"
+
+          file "$OUTPUT_NAME"
+          ls -lh "$OUTPUT_NAME"
+
+          echo "binary_name=$OUTPUT_NAME" >> $GITHUB_OUTPUT
+
+      - name: Upload to release assets
+        run: |
+          gh release upload \
+            --repo ${{ github.repository }} \
+            ${{ github.event.release.tag_name }} \
+            ${{ steps.prepare.outputs.binary_name }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  freebsd-bin:
+    name: FreeBSD ${{ matrix.freebsd_version }} Binary
+    needs: frontend
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        freebsd_version:
+          - "14"
+          - "15"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Set version environment variable
+        run: |
+          RELEASE_TAG="${{ github.event.release.tag_name }}"
+          echo "RELEASE_VERSION=${RELEASE_TAG#v}" >> $GITHUB_ENV
+
+      - name: Download frontend artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-pages
+          path: src/
+
+      - name: Install dependencies and Build on FreeBSD ${{ matrix.freebsd_version }}.0
+        uses: vmactions/freebsd-vm@v1
+        with:
+          release: "${{ matrix.freebsd_version }}.0"
+          usesh: true
+          prepare: |
+            echo "=== FreeBSD version ==="
+            uname -r
+
+            echo "=== Install dependencies ==="
+            pkg install -y gmake pkgconf cmake
+
+          run: |
+            cd $GITHUB_WORKSPACE
+
+            echo "=== Build binary ==="
+            mkdir -p build && cd build
+
+            RELEASE_VERSION="${{ env.RELEASE_VERSION }}" cmake "${GITHUB_WORKSPACE}" \
+              -DCMAKE_INSTALL_PREFIX=/usr/local \
+              -DCMAKE_INSTALL_SYSCONFDIR=/etc \
+              -DCMAKE_BUILD_TYPE=Release \
+              -DENABLE_AGGRESSIVE_OPT=ON \
+              -DCMAKE_SYSTEM_NAME=FreeBSD
+
+            cmake --build . -j$(nproc)
+
+            echo "=== Verify binary ==="
+            file rtp2httpd
+            ldd rtp2httpd || true
+
+            echo "=== Stage binary ==="
+            DESTDIR="${GITHUB_WORKSPACE}/staging" cmake --install . --strip
+
+            echo "=== Verify Stage binary ==="
+            file ${GITHUB_WORKSPACE}/staging/usr/local/bin/rtp2httpd
+            ldd ${GITHUB_WORKSPACE}/staging/usr/local/bin/rtp2httpd || true
+
+      - name: Prepare release artifact
+        id: prepare
+        run: |
+          BINARY_SRC="staging/usr/local/bin/rtp2httpd"
+          BINARY_DST="rtp2httpd-${RELEASE_VERSION}-freebsd${{ matrix.freebsd_version }}-x86_64"
+
+          if [ ! -f "$BINARY_SRC" ]; then
+            echo "Error: Binary not found at $BINARY_SRC"
+            exit 1
+          fi
+
+          cp "$BINARY_SRC" "$BINARY_DST"
+          file "$BINARY_DST"
+          ls -lh "$BINARY_DST"
+
+          echo "binary_name=$BINARY_DST" >> $GITHUB_OUTPUT
 
       - name: Upload to release assets
         run: |
